@@ -1,4 +1,4 @@
-.TH MELOSD 1 "2026-11-17" "melos 0.1.0" "User Commands"
+.TH MELOSD 1 "2026-11-17" "melos 0.2.0" "User Commands"
 .SH NAME
 melosd \- resident daemon for the melos music player
 .SH SYNOPSIS
@@ -6,7 +6,8 @@ melosd \- resident daemon for the melos music player
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B melosd
-owns playback, the library index, media downloads, and the MPRIS interface for
+owns playback, the library index, listening statistics, media downloads, and
+the MPRIS interface for
 .BR melos (1).
 It listens on a Unix socket and accepts newline-delimited JSON commands from
 clients.
@@ -74,6 +75,9 @@ Output from a daemon spawned by the TUI.
 .I ~/.local/state/melos/download\-N.log
 yt-dlp stderr for each download job, kept for troubleshooting.
 .TP
+.I ~/.cache/melos/art
+Embedded cover art extracted from tracks and cached for the interface.
+.TP
 .IR $XDG_RUNTIME_DIR /melos/daemon.sock
 Client socket, mode 0600.
 .TP
@@ -89,7 +93,7 @@ daemon uses it instead of binding its own.
 Log filter, for example
 .BR melosd=debug .
 .TP
-.B XDG_CONFIG_HOME ", " XDG_DATA_HOME ", " XDG_STATE_HOME ", " XDG_RUNTIME_DIR
+.B XDG_CONFIG_HOME ", " XDG_DATA_HOME ", " XDG_STATE_HOME ", " XDG_CACHE_HOME ", " XDG_RUNTIME_DIR
 XDG base directories.
 .SH EXIT STATUS
 Zero on clean shutdown, non-zero if the socket cannot be bound, the database

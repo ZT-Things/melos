@@ -39,6 +39,8 @@ rusqlite = { version = "0.43", default-features = false, features = ["cache"] }
 lofty = "0.25"
 ratatui = "0.30"
 crossterm = "0.29"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 unicode-width = "0.2"
 mpris-server = { version = "0.11", features = ["tokio"] }
 

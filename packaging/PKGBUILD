@@ -1,6 +1,6 @@
 # Maintainer: ZT <ztthingsgm@gmail.com>
 pkgname=melos
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Fast, minimal TUI music player with YouTube downloads"
 arch=('x86_64' 'aarch64')
@@ -12,7 +12,7 @@ optdepends=('ffmpeg: audio extraction and thumbnail embedding for yt-dlp')
 provides=('melos')
 conflicts=('melos-bin' 'melos-git')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-sha256sums=('81c8bfdc31e9decb2d308ca29ebcab57d087f54cbb3a23f56563db825b2585e1')
+sha256sums=('SKIP')  # TODO: v0.2.0 release checksum
 
 build() {
     cd "$pkgname-$pkgver"

@@ -59,6 +59,7 @@ impl KeyMap {
             "pane_playlists",
             "pane_queue",
             "pane_downloads",
+            "pane_stats",
             "confirm",
             "pause",
             "next",
@@ -75,6 +76,8 @@ impl KeyMap {
             "queue_add",
             "playlist_add",
             "remove",
+            "delete_track",
+            "rename",
             "filter",
             "download",
             "playlist_delete",
@@ -129,6 +132,7 @@ pub fn chord_of(key: KeyEvent) -> String {
         KeyCode::End => "end".into(),
         KeyCode::PageUp => "pageup".into(),
         KeyCode::PageDown => "pagedown".into(),
+        KeyCode::F(n) => format!("f{n}"),
         _ => return String::new(),
     };
     parts.push(base);

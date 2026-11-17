@@ -228,10 +228,8 @@ async fn reader_task(read: OwnedReadHalf, events: mpsc::UnboundedSender<MpvEvent
                             let _ = events.send(MpvEvent::Mute(m));
                         }
                     }
-                    "idle-active" => {
-                        if data.and_then(Value::as_bool) == Some(true) {
-                            let _ = events.send(MpvEvent::Idle);
-                        }
+                    "idle-active" if data.and_then(Value::as_bool) == Some(true) => {
+                        let _ = events.send(MpvEvent::Idle);
                     }
                     _ => {}
                 }

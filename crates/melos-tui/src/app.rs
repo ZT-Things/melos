@@ -4,6 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use melos_proto::{
     Action, DownloadState, ServerMsg, TrackRow, ViewModel, format_duration, truncate,
 };
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 
 use crate::keys::KeyMap;
 
@@ -14,6 +16,7 @@ pub enum View {
     PlaylistTracks,
     Queue,
     Downloads,
+    Stats,
 }
 
 impl View {
@@ -24,6 +27,7 @@ impl View {
             View::PlaylistTracks => "Playlist",
             View::Queue => "Queue",
             View::Downloads => "Downloads",
+            View::Stats => "Statistics",
         }
     }
 }
@@ -34,11 +38,13 @@ pub enum Focus {
     Main,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputKind {
     Filter,
     Download,
     NewPlaylist,
+    RenameTrack(i64),
+    RenamePlaylist(i64),
 }
 
 pub struct Input {
@@ -46,10 +52,24 @@ pub struct Input {
     pub buffer: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteChoice {
+    Melos,
+    File,
+}
+
 #[derive(Debug, Clone)]
 pub enum Overlay {
     Help,
-    PlaylistPicker { track_id: i64, index: usize },
+    PlaylistPicker {
+        track_id: i64,
+        index: usize,
+    },
+    DeleteTrack {
+        track_id: i64,
+        title: String,
+        choice: DeleteChoice,
+    },
 }
 
 pub struct App {
@@ -66,14 +86,23 @@ pub struct App {
     pub status_override: Option<String>,
     pub daemon_lost: bool,
     pub daemon_version: String,
+    pub picker: Option<Picker>,
+    pub art: Option<StatefulProtocol>,
+    art_path: Option<String>,
 }
 
-const SIDEBAR_VIEWS: [View; 4] = [View::Library, View::Playlists, View::Queue, View::Downloads];
+const SIDEBAR_VIEWS: [View; 5] = [
+    View::Library,
+    View::Playlists,
+    View::Queue,
+    View::Downloads,
+    View::Stats,
+];
 
 impl App {
     pub fn new(vm: ViewModel, keys: KeyMap) -> Self {
         let daemon_version = vm.daemon_version.clone();
-        Self {
+        let mut app = Self {
             vm,
             view: View::Library,
             focus: Focus::Main,
@@ -87,6 +116,34 @@ impl App {
             status_override: None,
             daemon_lost: false,
             daemon_version,
+            picker: None,
+            art: None,
+            art_path: None,
+        };
+        app.reveal_current();
+        app
+    }
+
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.picker = Some(picker);
+        self.load_art();
+    }
+
+    fn set_art_path(&mut self, path: Option<String>) {
+        if self.art_path == path {
+            return;
+        }
+        self.art_path = path;
+        self.art = None;
+        self.load_art();
+    }
+
+    fn load_art(&mut self) {
+        let (Some(path), Some(picker)) = (self.art_path.as_deref(), self.picker.as_ref()) else {
+            return;
+        };
+        if let Ok(image) = image::open(path) {
+            self.art = Some(picker.new_resize_protocol(image));
         }
     }
 
@@ -98,10 +155,14 @@ impl App {
                 ..
             } => {
                 self.daemon_version = daemon_version;
+                let art = snapshot.transport.art_path.clone();
                 self.vm = snapshot;
+                self.set_art_path(art);
             }
             ServerMsg::State { snapshot } => {
+                let art = snapshot.transport.art_path.clone();
                 self.vm = snapshot;
+                self.set_art_path(art);
                 if self.view == View::PlaylistTracks && self.vm.selected_playlist.is_none() {
                     self.view = View::Playlists;
                     self.main_idx = 0;
@@ -111,7 +172,9 @@ impl App {
                 }
             }
             ServerMsg::Transport { transport } => {
+                let art = transport.art_path.clone();
                 self.vm.transport = transport;
+                self.set_art_path(art);
             }
             ServerMsg::Toast { text } => {
                 self.status_override = Some(text);
@@ -156,6 +219,7 @@ impl App {
             View::Playlists => self.vm.playlists.len(),
             View::Queue => self.vm.queue.len(),
             View::Downloads => self.vm.yt_results.len() + self.vm.downloads.len(),
+            View::Stats => 0,
         }
     }
 
@@ -187,6 +251,23 @@ impl App {
         }
     }
 
+    /// Put the cursor on the currently playing track, if it is in this view.
+    fn reveal_current(&mut self) {
+        if self.view != View::Library {
+            return;
+        }
+        let Some(current) = self.vm.transport.track.as_ref().map(|t| t.id) else {
+            return;
+        };
+        if let Some(index) = self
+            .visible_tracks()
+            .iter()
+            .position(|track| track.id == current)
+        {
+            self.main_idx = index;
+        }
+    }
+
     fn set_view(&mut self, view: View) {
         self.view = view;
         self.main_idx = 0;
@@ -196,6 +277,7 @@ impl App {
         {
             self.input = None;
         }
+        self.reveal_current();
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -259,7 +341,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let text = input.buffer.trim().to_string();
-                    match input.kind {
+                    match input.kind.clone() {
                         InputKind::Filter => {
                             self.filter = text;
                             self.main_idx = 0;
@@ -270,6 +352,22 @@ impl App {
                                 self.view = View::Playlists;
                                 self.sidebar_idx = 1;
                                 self.main_idx = 0;
+                            }
+                        }
+                        InputKind::RenameTrack(track_id) => {
+                            if !text.is_empty() {
+                                actions.push(Action::RenameTrack {
+                                    track_id,
+                                    title: text,
+                                });
+                            }
+                        }
+                        InputKind::RenamePlaylist(playlist_id) => {
+                            if !text.is_empty() {
+                                actions.push(Action::RenamePlaylist {
+                                    playlist_id,
+                                    name: text,
+                                });
                             }
                         }
                         InputKind::Download => {
@@ -344,6 +442,42 @@ impl App {
                         self.overlay = Some(Overlay::PlaylistPicker { track_id, index });
                     }
                 },
+                Overlay::DeleteTrack {
+                    track_id,
+                    title,
+                    mut choice,
+                } => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        choice = DeleteChoice::File;
+                        self.overlay = Some(Overlay::DeleteTrack {
+                            track_id,
+                            title,
+                            choice,
+                        });
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        choice = DeleteChoice::Melos;
+                        self.overlay = Some(Overlay::DeleteTrack {
+                            track_id,
+                            title,
+                            choice,
+                        });
+                    }
+                    KeyCode::Enter => {
+                        actions.push(Action::DeleteTrack {
+                            track_id,
+                            delete_file: choice == DeleteChoice::File,
+                        });
+                    }
+                    _ => {
+                        self.overlay = Some(Overlay::DeleteTrack {
+                            track_id,
+                            title,
+                            choice,
+                        });
+                    }
+                },
             }
             return actions;
         }
@@ -361,6 +495,9 @@ impl App {
             "down" => {
                 if self.focus == Focus::Sidebar {
                     self.sidebar_move(1);
+                    if self.view == View::Stats {
+                        actions.push(Action::RequestStats);
+                    }
                 } else {
                     self.move_cursor(1);
                 }
@@ -368,6 +505,9 @@ impl App {
             "up" => {
                 if self.focus == Focus::Sidebar {
                     self.sidebar_move(-1);
+                    if self.view == View::Stats {
+                        actions.push(Action::RequestStats);
+                    }
                 } else {
                     self.move_cursor(-1);
                 }
@@ -408,6 +548,12 @@ impl App {
                 self.sidebar_idx = 3;
                 self.set_view(View::Downloads);
                 self.focus = Focus::Main;
+            }
+            "pane_stats" => {
+                self.sidebar_idx = 4;
+                self.set_view(View::Stats);
+                self.focus = Focus::Main;
+                actions.push(Action::RequestStats);
             }
             "confirm" => actions.extend(self.activate()),
             "pause" => actions.push(Action::PauseToggle),
@@ -469,8 +615,11 @@ impl App {
                         actions.push(Action::CancelDownload { id: job.id });
                     }
                 }
+                View::Library => self.open_delete(),
                 _ => {}
             },
+            "delete_track" => self.open_delete(),
+            "rename" => self.start_rename(),
             "filter" => self.open_filter(),
             "help" => self.overlay = Some(Overlay::Help),
             "download" => self.start_download_prompt(),
@@ -490,12 +639,55 @@ impl App {
         actions
     }
 
+    fn open_delete(&mut self) {
+        if !matches!(self.view, View::Library | View::PlaylistTracks) {
+            return;
+        }
+        let Some((track_id, title)) = self
+            .visible_tracks()
+            .get(self.main_idx)
+            .map(|track| (track.id, track.title.clone()))
+        else {
+            return;
+        };
+        self.overlay = Some(Overlay::DeleteTrack {
+            track_id,
+            title,
+            choice: DeleteChoice::Melos,
+        });
+    }
+
+    fn start_rename(&mut self) {
+        match self.view {
+            View::Playlists => {
+                if let Some(playlist) = self.vm.playlists.get(self.main_idx) {
+                    self.input = Some(Input {
+                        kind: InputKind::RenamePlaylist(playlist.id),
+                        buffer: playlist.name.clone(),
+                    });
+                }
+            }
+            View::Library | View::PlaylistTracks => {
+                if let Some(track) = self.visible_tracks().get(self.main_idx) {
+                    self.input = Some(Input {
+                        kind: InputKind::RenameTrack(track.id),
+                        buffer: track.title.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn activate(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         if self.focus == Focus::Sidebar {
             self.sidebar_idx = self.sidebar_idx.min(SIDEBAR_VIEWS.len() - 1);
             self.set_view(SIDEBAR_VIEWS[self.sidebar_idx]);
             self.focus = Focus::Main;
+            if self.view == View::Stats {
+                actions.push(Action::RequestStats);
+            }
             return actions;
         }
         match self.view {
@@ -533,6 +725,7 @@ impl App {
                     self.main_idx = 0;
                 }
             }
+            View::Stats => {}
         }
         actions
     }
@@ -562,6 +755,7 @@ impl App {
                     .filter(|d| !d.state.is_finished())
                     .count(),
             ),
+            ("Statistics".to_string(), 0),
         ]
     }
 
@@ -601,6 +795,36 @@ pub fn track_label(t: &TrackRow) -> String {
 mod tests {
     use super::*;
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn track(id: i64, title: &str) -> TrackRow {
+        TrackRow {
+            id,
+            title: title.into(),
+            artist: "Artist".into(),
+            album: None,
+            duration_ms: 60_000,
+            missing: false,
+        }
+    }
+
+    fn app_with_tracks() -> App {
+        let vm = ViewModel {
+            tracks: vec![track(1, "One"), track(2, "Two"), track(3, "Three")],
+            transport: melos_proto::Transport {
+                track: Some(track(2, "Two")),
+                ..Default::default()
+            },
+            ..ViewModel::default()
+        };
+        App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        )
+    }
+
     #[test]
     fn fuzzy_subsequence() {
         assert!(fuzzy_match("dft", "Daft Punk"));
@@ -623,5 +847,109 @@ mod tests {
             error: None,
         };
         assert!(app.download_label(&d).chars().count() < 80);
+    }
+
+    #[test]
+    fn library_reveals_the_currently_playing_track() {
+        let app = app_with_tracks();
+        assert_eq!(app.main_idx, 1);
+        assert_eq!(app.selected_track_id(), Some(2));
+    }
+
+    #[test]
+    fn delete_opens_a_safe_choice_and_removes_from_melos_by_default() {
+        let mut app = app_with_tracks();
+        assert!(app.on_key(key(KeyCode::Delete)).is_empty());
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::DeleteTrack {
+                track_id: 2,
+                choice: DeleteChoice::Melos,
+                ..
+            })
+        ));
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::DeleteTrack {
+                track_id: 2,
+                delete_file: false
+            }]
+        ));
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn delete_choice_can_select_the_file_and_warns() {
+        let mut app = app_with_tracks();
+        app.on_key(key(KeyCode::Delete));
+        app.on_key(key(KeyCode::Char('j')));
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::DeleteTrack {
+                track_id: 2,
+                delete_file: true
+            }]
+        ));
+    }
+
+    #[test]
+    fn rename_prompt_is_prefilled_and_submits_the_new_name() {
+        let vm = ViewModel {
+            playlists: vec![melos_proto::PlaylistRow {
+                id: 7,
+                name: "Old".into(),
+                count: 0,
+            }],
+            ..ViewModel::default()
+        };
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+        app.set_view(View::Playlists);
+        app.on_key(key(KeyCode::Char('e')));
+        let input = app.input.as_ref().expect("rename prompt");
+        assert_eq!(input.buffer, "Old");
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::RenamePlaylist {
+                playlist_id: 7,
+                name
+            }] if name == "Old"
+        ));
+    }
+
+    #[test]
+    fn playlist_tracks_keep_d_as_remove_from_playlist() {
+        let vm = ViewModel {
+            tracks: vec![track(1, "One")],
+            selected_playlist: Some(3),
+            playlist_tracks: vec![track(1, "One")],
+            ..ViewModel::default()
+        };
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+        app.view = View::PlaylistTracks;
+        let actions = app.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::RemoveFromPlaylist {
+                playlist_id: 3,
+                track_id: 1
+            }]
+        ));
+    }
+
+    #[test]
+    fn stats_pane_requests_fresh_totals() {
+        let mut app = app_with_tracks();
+        let actions = app.on_key(key(KeyCode::Char('5')));
+        assert_eq!(app.view, View::Stats);
+        assert!(matches!(actions.as_slice(), [Action::RequestStats]));
     }
 }

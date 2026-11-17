@@ -18,3 +18,6 @@ extra_args = []                # extra mpv arguments
 # up = ["k", "up"]
 # quit = ["q", "ctrl+c"]
 # shutdown = ["Q"]
+# delete_track = ["delete"]
+# rename = ["e", "F2"]
+# pane_stats = ["5"]

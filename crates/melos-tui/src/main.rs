@@ -13,6 +13,8 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event};
 use melos_proto::Action;
 use melos_proto::config::Config;
+use ratatui_image::picker::Picker;
+use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
@@ -109,6 +111,44 @@ async fn stop() -> Result<()> {
     Ok(())
 }
 
+/// Terminal stdio queries can consume a keypress and briefly leave raw mode, so
+/// only probe terminals where Kitty graphics are actually likely. tmux uses the
+/// reliable halfblock fallback instead.
+fn wants_graphics_query(
+    tmux: bool,
+    term: Option<&str>,
+    term_program: Option<&str>,
+    kitty_window: Option<&str>,
+) -> bool {
+    if tmux {
+        return false;
+    }
+    term.is_some_and(|value| value.contains("kitty"))
+        || term_program.is_some_and(|value| value.eq_ignore_ascii_case("kitty"))
+        || kitty_window.is_some()
+}
+
+fn detect_picker() -> Picker {
+    let tmux = std::env::var_os("TMUX").is_some();
+    let term = std::env::var("TERM").ok();
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let kitty_window = std::env::var("KITTY_WINDOW_ID").ok();
+    if wants_graphics_query(
+        tmux,
+        term.as_deref(),
+        term_program.as_deref(),
+        kitty_window.as_deref(),
+    ) {
+        Picker::from_query_stdio_with_options(QueryStdioOptions {
+            timeout: Duration::from_millis(500),
+            ..Default::default()
+        })
+        .unwrap_or_else(|_| Picker::halfblocks())
+    } else {
+        Picker::halfblocks()
+    }
+}
+
 async fn run_tui(args: Args, t0: Instant) -> Result<()> {
     let cfg = match Config::load(args.config.as_deref()) {
         Ok(cfg) => cfg,
@@ -124,8 +164,10 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
 
     let mut app = App::new(snapshot, KeyMap::from_config(&cfg.keys));
 
+    let picker = detect_picker();
     let mut terminal = ratatui::init();
     let guard = Restore;
+    app.set_picker(picker);
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     let t_first_frame = t0.elapsed();
 
@@ -208,4 +250,31 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_query_is_only_used_for_direct_kitty_terminals() {
+        assert!(wants_graphics_query(
+            false,
+            Some("xterm-kitty"),
+            Some("kitty"),
+            None
+        ));
+        assert!(!wants_graphics_query(
+            true,
+            Some("xterm-kitty"),
+            Some("kitty"),
+            None
+        ));
+        assert!(!wants_graphics_query(
+            false,
+            Some("xterm-256color"),
+            Some("tmux"),
+            None
+        ));
+    }
 }

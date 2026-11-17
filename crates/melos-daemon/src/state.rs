@@ -14,6 +14,7 @@ use mpris_server::Server;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::art;
 use crate::db::Db;
 use crate::download;
 use crate::mpris::{self, Info, Mpris, TrackInfo};
@@ -26,6 +27,7 @@ pub enum Internal {
     Download(download::Event),
     Client(mpsc::UnboundedSender<ServerMsg>),
     Mpris(Arc<Server<Mpris>>, Arc<Mutex<Info>>),
+    Artwork { track_id: i64, path: Option<String> },
     Note(String),
     Tick,
 }
@@ -56,6 +58,8 @@ pub struct Daemon {
     mpris: Option<Arc<Server<Mpris>>>,
     mpris_info: Option<Arc<Mutex<Info>>>,
     listening: ListenTracker,
+    art_path: Option<String>,
+    art_track: Option<i64>,
 }
 
 impl Daemon {
@@ -117,6 +121,8 @@ impl Daemon {
             mpris: None,
             mpris_info: None,
             listening: ListenTracker::new(),
+            art_path: None,
+            art_track: None,
         }
     }
 
@@ -169,7 +175,7 @@ impl Daemon {
                     self.status = e.to_string();
                 }
                 self.persist();
-                self.broadcast_state_seek(seeked.then(|| self.player.position_ms));
+                self.broadcast_state_seek(seeked.then_some(self.player.position_ms));
                 self.transport_dirty = false;
             }
             Internal::Mpv(event) => {
@@ -195,6 +201,13 @@ impl Daemon {
             }
             Internal::Mpris(server, info) => {
                 self.set_mpris(server, info);
+            }
+            Internal::Artwork { track_id, path } => {
+                if self.player.current_id() == Some(track_id) {
+                    self.art_path = path;
+                    self.art_track = Some(track_id);
+                    self.transport_dirty = true;
+                }
             }
             Internal::Note(note) => {
                 self.status = note;
@@ -364,6 +377,7 @@ impl Daemon {
                 let was_current = self.player.current_id() == Some(track_id);
                 self.player.remove_track(track_id);
                 self.db.delete_track(track_id)?;
+                crate::art::remove(track_id);
                 self.refresh_library()?;
                 self.refresh_playlists()?;
                 self.refresh_playlist_tracks()?;
@@ -520,10 +534,37 @@ impl Daemon {
         Ok(())
     }
 
+    fn request_artwork(&mut self, track_id: i64, path: String) {
+        self.art_path = None;
+        self.art_track = None;
+        let path = PathBuf::from(path);
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let artwork = art::extract(track_id, &path, mtime);
+            let _ = tx.send(Internal::Artwork {
+                track_id,
+                path: artwork,
+            });
+        });
+    }
+
     fn on_mpv(&mut self, event: MpvEvent) -> Result<()> {
         match event {
             MpvEvent::FileLoaded => {
                 self.player.set_loaded(true);
+                let artwork = self
+                    .player
+                    .current_id()
+                    .and_then(|id| self.db.track(id).ok().flatten().map(|(_, path)| (id, path)));
+                if let Some((track_id, path)) = artwork {
+                    self.request_artwork(track_id, path);
+                }
             }
             MpvEvent::EndFile { reason } => {
                 // `stop`/`redirect` are emitted when mpv replaces a file;
@@ -694,9 +735,13 @@ impl Daemon {
             .current_id()
             .and_then(|id| self.db.track(id).ok().flatten())
             .map(|(row, _)| row);
+        let art_path = match track.as_ref() {
+            Some(track) if self.art_track == Some(track.id) => self.art_path.clone(),
+            _ => None,
+        };
         Transport {
             track,
-            art_path: None,
+            art_path,
             position_ms: self.player.position_ms,
             duration_ms: self.player.duration_ms,
             playing: self.player.playing,

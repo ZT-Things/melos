@@ -1,6 +1,7 @@
 //! `melosd` — the resident daemon. Owns playback, the library, downloads and
 //! (eventually) MPRIS. The TUI is a thin client over the unix socket.
 
+mod art;
 mod db;
 mod download;
 mod mpris;
@@ -114,12 +115,12 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let tx = tx.clone();
         async move {
-            if let Some(age) = download::yt_dlp_age_days().await {
-                if age > 90 {
-                    let _ = tx.send(Internal::Note(format!(
-                        "yt-dlp is {age} days old — update it if downloads fail"
-                    )));
-                }
+            if let Some(age) = download::yt_dlp_age_days().await
+                && age > 90
+            {
+                let _ = tx.send(Internal::Note(format!(
+                    "yt-dlp is {age} days old — update it if downloads fail"
+                )));
             }
         }
     });
@@ -251,10 +252,10 @@ async fn client_session(stream: UnixStream, tx: mpsc::UnboundedSender<Internal>)
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                if let Ok(ClientMsg::Action { action }) = serde_json::from_str::<ClientMsg>(&line) {
-                    if tx.send(Internal::Action(action)).is_err() {
-                        return;
-                    }
+                if let Ok(ClientMsg::Action { action }) = serde_json::from_str::<ClientMsg>(&line)
+                    && tx.send(Internal::Action(action)).is_err()
+                {
+                    return;
                 }
             }
             Ok(None) => return,

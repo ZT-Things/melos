@@ -38,21 +38,12 @@ impl Default for Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct DownloadConfig {
     /// e.g. "firefox" — passed to yt-dlp as `--cookies-from-browser`.
     pub cookies_from_browser: String,
     pub proxy: String,
     pub extra_args: Vec<String>,
-}
-
-impl Default for DownloadConfig {
-    fn default() -> Self {
-        Self {
-            cookies_from_browser: String::new(),
-            proxy: String::new(),
-            extra_args: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,6 +123,8 @@ pub fn default_keys() -> BTreeMap<String, Vec<String>> {
         ("playlist_add", &["A"]),
         ("new_playlist", &["N"]),
         ("remove", &["d"]),
+        ("delete_track", &["delete"]),
+        ("rename", &["e", "F2"]),
         ("filter", &["/"]),
         ("help", &["?"]),
         ("tab", &["tab"]),
@@ -139,6 +132,7 @@ pub fn default_keys() -> BTreeMap<String, Vec<String>> {
         ("pane_playlists", &["2"]),
         ("pane_queue", &["3"]),
         ("pane_downloads", &["4"]),
+        ("pane_stats", &["5"]),
         ("download", &["i"]),
         ("playlist_delete", &["x"]),
         ("cancel", &["esc"]),
@@ -155,9 +149,11 @@ mod tests {
 
     #[test]
     fn defaults_are_sane() {
-        let mut cfg = Config::default();
-        cfg.concurrent_downloads = 99;
-        cfg.audio_format = "flac".into();
+        let mut cfg = Config {
+            concurrent_downloads: 99,
+            audio_format: "flac".into(),
+            ..Config::default()
+        };
         cfg.normalize();
         assert_eq!(cfg.concurrent_downloads, 5);
         assert_eq!(cfg.audio_format, "opus");

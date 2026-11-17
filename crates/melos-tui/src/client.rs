@@ -1,6 +1,7 @@
 //! Thin socket client: handshake, action writer, server message reader, and
 //! auto-spawn of the daemon when nothing is listening.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -11,10 +12,48 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+const LEGACY_PROTOCOL: u32 = 1;
+
+#[derive(Debug)]
 pub struct ClientHandle {
     pub rx: mpsc::UnboundedReceiver<ServerMsg>,
     pub tx: mpsc::UnboundedSender<Action>,
 }
+
+#[derive(Debug)]
+struct ProtocolMismatch {
+    daemon: Option<u32>,
+    client: u32,
+    detail: Option<String>,
+}
+
+impl ProtocolMismatch {
+    fn new(daemon: Option<u32>, client: u32) -> Self {
+        Self {
+            daemon,
+            client,
+            detail: None,
+        }
+    }
+}
+
+impl fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(detail) = &self.detail {
+            return f.write_str(detail);
+        }
+        write!(
+            f,
+            "protocol mismatch (daemon {}, client {})",
+            self.daemon
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            self.client
+        )
+    }
+}
+
+impl std::error::Error for ProtocolMismatch {}
 
 /// Connect, starting the daemon if needed.
 ///
@@ -24,16 +63,25 @@ pub struct ClientHandle {
 /// adds startup latency.
 pub async fn connect(spawn: bool) -> Result<(ClientHandle, ViewModel)> {
     let path = paths::socket_path();
+    let mut last_error = None;
 
     for _ in 0..2 {
-        if let Ok(pair) = connect_once(&path).await {
-            return Ok(pair);
+        match connect_once(&path).await {
+            Ok(pair) => return Ok(pair),
+            Err(error) => last_error = Some(error),
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     if !spawn {
-        bail!("melosd is not running");
+        return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("melosd is not running")));
+    }
+
+    if last_error
+        .as_ref()
+        .is_some_and(|error| error.downcast_ref::<ProtocolMismatch>().is_some())
+    {
+        let _ = retire_legacy(&path).await;
     }
 
     spawn_daemon()?;
@@ -52,18 +100,56 @@ pub async fn connect(spawn: bool) -> Result<(ClientHandle, ViewModel)> {
 }
 
 /// One connection attempt. Does not spawn anything.
+///
+/// A daemon from the previous protocol generation is still readable enough to
+/// report status and to shut down, which keeps `melos status` and `melos stop`
+/// useful during an upgrade.
 pub async fn probe() -> Result<(ClientHandle, ViewModel)> {
-    connect_once(&paths::socket_path()).await
+    let path = paths::socket_path();
+    let error = match connect_once(&path).await {
+        Ok(pair) => return Ok(pair),
+        Err(error) => error,
+    };
+    if error.downcast_ref::<ProtocolMismatch>().is_some()
+        && let Ok(pair) = connect_once_with_protocol(&path, LEGACY_PROTOCOL).await
+    {
+        return Ok(pair);
+    }
+    Err(error)
+}
+
+/// Ask a protocol-1 daemon to shut down so a freshly installed daemon can take
+/// over the socket. Best effort: a failed retirement just falls back to the
+/// normal connect error.
+async fn retire_legacy(path: &Path) -> bool {
+    let Ok((handle, _)) = connect_once_with_protocol(path, LEGACY_PROTOCOL).await else {
+        return false;
+    };
+    let _ = handle.tx.send(Action::Shutdown);
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if UnixStream::connect(path).await.is_err() {
+            return true;
+        }
+    }
+    false
 }
 
 async fn connect_once(path: &Path) -> Result<(ClientHandle, ViewModel)> {
+    connect_once_with_protocol(path, PROTOCOL_VERSION).await
+}
+
+async fn connect_once_with_protocol(
+    path: &Path,
+    protocol: u32,
+) -> Result<(ClientHandle, ViewModel)> {
     let stream = tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(path))
         .await
         .context("connection timed out")??;
     let (read, mut write) = stream.into_split();
 
     let hello = ClientMsg::Hello {
-        protocol: PROTOCOL_VERSION,
+        protocol,
         client: format!("melos-tui/{}", env!("CARGO_PKG_VERSION")),
     };
     let mut line = serde_json::to_string(&hello)?;
@@ -80,14 +166,31 @@ async fn connect_once(path: &Path) -> Result<(ClientHandle, ViewModel)> {
 
     let snapshot = match msg {
         ServerMsg::Welcome {
-            protocol, snapshot, ..
+            protocol: daemon_protocol,
+            snapshot,
+            ..
         } => {
-            if protocol != PROTOCOL_VERSION {
-                bail!("protocol mismatch (daemon {protocol}, client {PROTOCOL_VERSION})");
+            if daemon_protocol != protocol {
+                return Err(ProtocolMismatch::new(Some(daemon_protocol), protocol).into());
             }
             snapshot
         }
-        ServerMsg::Error { message } => bail!(message),
+        ServerMsg::Error { message } => {
+            if message.starts_with("protocol mismatch") {
+                let daemon = message
+                    .split("daemon ")
+                    .nth(1)
+                    .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                    .and_then(|digits| digits.parse().ok());
+                return Err(ProtocolMismatch {
+                    daemon,
+                    client: protocol,
+                    detail: Some(message),
+                }
+                .into());
+            }
+            bail!(message)
+        }
         other => bail!("unexpected handshake message: {other:?}"),
     };
 
@@ -172,4 +275,76 @@ fn spawn_daemon() -> Result<()> {
         }
     }
     bail!("could not start melosd; install it in PATH or run it manually")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn protocol_mismatch_is_a_typed_error() {
+        let path = std::env::temp_dir().join(format!(
+            "melos-client-test-welcome-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let _ = lines.next_line().await.unwrap();
+            let reply = serde_json::to_string(&ServerMsg::Welcome {
+                protocol: 99,
+                daemon_version: "test".into(),
+                snapshot: ViewModel::default(),
+            })
+            .unwrap();
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        });
+
+        let err = connect_once_with_protocol(&path, PROTOCOL_VERSION)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<ProtocolMismatch>().is_some());
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn protocol_mismatch_error_reply_is_typed() {
+        let path = std::env::temp_dir().join(format!(
+            "melos-client-test-error-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let _ = lines.next_line().await.unwrap();
+            let reply = serde_json::to_string(&ServerMsg::Error {
+                message: "protocol mismatch (daemon 1, client 2)".into(),
+            })
+            .unwrap();
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        });
+
+        let err = connect_once_with_protocol(&path, PROTOCOL_VERSION)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<ProtocolMismatch>().is_some());
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
 }

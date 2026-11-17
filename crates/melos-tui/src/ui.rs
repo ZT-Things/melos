@@ -2,24 +2,29 @@
 
 use melos_proto::{DownloadState, Repeat, format_duration, truncate};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+};
+use ratatui_image::{Resize, StatefulImage};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Focus, InputKind, Overlay, View};
+use crate::app::{App, DeleteChoice, Focus, InputKind, Overlay, View};
 
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
-const NOW: Color = Color::Green;
+const ACCENT: Color = Color::Rgb(214, 168, 95);
+const NOW: Color = Color::Rgb(157, 191, 143);
+const DIM: Color = Color::Rgb(122, 116, 106);
+const SURFACE: Color = Color::Rgb(48, 44, 40);
+const DANGER: Color = Color::Rgb(207, 106, 94);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.clamp_cursor();
     let area = frame.area();
     let [body, now, status] = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -35,48 +40,115 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         match overlay {
             Overlay::Help => draw_help(frame, app, area),
             Overlay::PlaylistPicker { index, .. } => draw_picker(frame, app, area, *index),
+            Overlay::DeleteTrack { title, choice, .. } => {
+                draw_delete(frame, area, title, *choice);
+            }
         }
     }
     if let Some(input) = &app.input {
-        draw_input(frame, app, input.kind, &input.buffer, status);
+        draw_input(frame, app, &input.kind, &input.buffer, status);
     }
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered().title(Line::from(vec![
-        Span::styled(
-            " melos ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Line::from(vec![
+            Span::styled(
+                " melos ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("v{} ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(DIM),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let art_height = if inner.height >= 16 {
+        ((inner.width as f32 * 0.55) as u16).clamp(6, 11)
+    } else {
+        0
+    };
+    let [art_area, meta_area, nav_area] = Layout::vertical([
+        Constraint::Length(art_height),
+        Constraint::Length(2),
+        Constraint::Min(3),
+    ])
+    .areas(inner);
+
+    if let Some(art) = app.art.as_mut() {
+        let image_area = Rect {
+            x: art_area.x.saturating_add(1),
+            width: art_area.width.saturating_sub(2),
+            ..art_area
+        };
+        frame.render_stateful_widget(
+            StatefulImage::new().resize(Resize::Crop(None)),
+            image_area,
+            art,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("♪")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            art_area,
+        );
+    }
+
+    let (title, artist) = match &app.vm.transport.track {
+        Some(track) => (
+            track.title.clone(),
+            if track.artist.is_empty() {
+                "unknown artist".to_string()
+            } else {
+                track.artist.clone()
+            },
         ),
-        Span::styled(
-            format!("v{} ", env!("CARGO_PKG_VERSION")),
+        None => (
+            "Nothing playing".to_string(),
+            "press i to find music".to_string(),
+        ),
+    };
+    let meta_width = meta_area.width.saturating_sub(2) as usize;
+    let meta = Paragraph::new(vec![
+        Line::from(Span::styled(
+            fit(&title, meta_width),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            fit(&artist, meta_width),
             Style::default().fg(DIM),
-        ),
-    ]));
+        )),
+    ]);
+    frame.render_widget(meta, meta_area);
+
     let labels = app.sidebar_labels();
     let items: Vec<ListItem> = labels
         .iter()
         .map(|(label, count)| {
-            ListItem::new(Line::from(vec![
-                Span::raw(label.clone()),
-                Span::styled(format!("  {count}"), Style::default().fg(DIM)),
-            ]))
+            let mut spans = vec![Span::raw(label.clone())];
+            if *count > 0 {
+                spans.push(Span::styled(format!("  {count}"), Style::default().fg(DIM)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let selected = if app.focus == Focus::Sidebar {
         Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White)
+            .bg(SURFACE)
+            .fg(Color::Reset)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ACCENT)
     };
     let list = List::new(items)
-        .block(block)
         .highlight_style(selected)
         .highlight_symbol("▸ ");
     let mut state = ListState::default().with_selected(Some(app.sidebar_idx));
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, nav_area, &mut state);
 }
 
 fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
@@ -95,12 +167,18 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
     if !app.filter.is_empty() {
         title.push_str(&format!("filter: {}  ", truncate(&app.filter, 30)));
     }
-    let block = Block::bordered().title(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        ));
+    if app.view == View::Stats {
+        draw_stats(frame, app, block, area);
+        return;
+    }
     let inner = block.inner(area);
     let width = inner.width.saturating_sub(4) as usize;
     let items = match app.view {
@@ -108,6 +186,7 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         View::Playlists => playlist_items(app, width),
         View::Queue => queue_items(app, width),
         View::Downloads => download_items(app, width),
+        View::Stats => Vec::new(),
     };
 
     if items.is_empty() {
@@ -121,6 +200,7 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
             }
             View::Queue => "The queue is empty. Press a on a track to add it.",
             View::Downloads => "Press i to search YouTube or paste a URL.",
+            View::Stats => "No listening time yet.",
         };
         let p = Paragraph::new(empty)
             .style(Style::default().fg(DIM))
@@ -134,8 +214,8 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .highlight_style(if app.focus == Focus::Main {
             Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
+                .bg(SURFACE)
+                .fg(Color::Reset)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -253,8 +333,171 @@ fn download_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
     items
 }
 
+fn draw_stats(frame: &mut Frame, app: &App, block: Block<'_>, area: Rect) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let stats = &app.vm.stats;
+    let [cards, gap1, week_title, days, gap2, tops] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(7),
+        Constraint::Length(1),
+        Constraint::Min(3),
+    ])
+    .areas(inner);
+    let [all, today, week] = Layout::horizontal([Constraint::Ratio(1, 3); 3]).areas(cards);
+    stat_card(frame, all, "all time", &human_time(stats.total_ms));
+    stat_card(frame, today, "today", &human_time(stats.today_ms));
+    stat_card(frame, week, "last 7 days", &human_time(stats.week_ms));
+
+    frame.render_widget(
+        Paragraph::new("Last 7 days")
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        week_title,
+    );
+    let _ = gap1;
+
+    if stats.total_ms == 0 {
+        let rest = Rect {
+            y: days.y,
+            height: inner.bottom().saturating_sub(days.y),
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new("Play a track and melos will start counting listening time.")
+                .style(Style::default().fg(DIM)),
+            rest,
+        );
+        return;
+    }
+
+    let max = stats.days.iter().map(|d| d.ms).max().unwrap_or(1).max(1);
+    let bar_width = inner.width.saturating_sub(16).max(8) as usize;
+    let mut lines = Vec::new();
+    for day in &stats.days {
+        let filled = ((day.ms as f64 / max as f64) * bar_width as f64).round() as usize;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<6}", day_label(&day.day)),
+                Style::default().fg(DIM),
+            ),
+            Span::styled(
+                format!("{:<18}", "█".repeat(filled)),
+                Style::default().fg(if filled > 0 { NOW } else { DIM }),
+            ),
+            Span::styled(human_time(day.ms), Style::default().fg(DIM)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), days);
+    let _ = gap2;
+
+    let [artists, tracks] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(tops);
+    frame.render_widget(
+        Paragraph::new(name_lines(
+            &stats.top_artists,
+            artists.width.saturating_sub(4) as usize,
+        ))
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM))
+                .title(Span::styled(" Top artists ", Style::default().fg(ACCENT))),
+        ),
+        artists,
+    );
+    let track_lines: Vec<Line> = stats
+        .top_tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let name = format!("{}. {} · {}", i + 1, t.title, t.artist);
+            Line::from(vec![
+                Span::styled(
+                    fit(&name, tracks.width.saturating_sub(10) as usize),
+                    Style::default(),
+                ),
+                Span::styled(format!("  {}", human_time(t.ms)), Style::default().fg(DIM)),
+            ])
+        })
+        .collect();
+    let track_lines = if track_lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "No plays yet.",
+            Style::default().fg(DIM),
+        ))]
+    } else {
+        track_lines
+    };
+    frame.render_widget(
+        Paragraph::new(track_lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(DIM))
+                .title(Span::styled(" Top tracks ", Style::default().fg(ACCENT))),
+        ),
+        tracks,
+    );
+}
+
+fn stat_card(frame: &mut Frame, area: Rect, label: &str, value: &str) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM))
+        .title(Span::styled(format!(" {label} "), Style::default().fg(DIM)));
+    frame.render_widget(
+        Paragraph::new(value.to_string())
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            .block(block),
+        area,
+    );
+}
+
+fn name_lines(rows: &[melos_proto::NameStat], width: usize) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No plays yet.",
+            Style::default().fg(DIM),
+        ))];
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let name = format!("{}. {}", i + 1, row.name);
+            Line::from(vec![
+                Span::styled(fit(&name, width.saturating_sub(10)), Style::default()),
+                Span::styled(
+                    format!("  {}", human_time(row.ms)),
+                    Style::default().fg(DIM),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn day_label(day: &str) -> String {
+    if day.len() >= 10 {
+        day[5..10].to_string()
+    } else {
+        day.to_string()
+    }
+}
+
+fn human_time(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
-    let [line_area, gauge_area, hint_area] = Layout::vertical([
+    let [title_area, artist_area, gauge_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -262,35 +505,43 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
     .areas(area);
     let t = &app.vm.transport;
 
-    let (left, right) = match &t.track {
+    let (title, artist, right) = match &t.track {
         Some(track) => {
             let icon = if t.playing { "▶" } else { "❚❚" };
-            let left = format!("{icon} {} — {}", track.title, track.artist);
-            let right = format!(
-                "{} / {}   vol {}{}",
-                format_duration(t.position_ms),
-                format_duration(t.duration_ms.max(track.duration_ms)),
-                t.volume,
-                if t.muted { "% (muted)" } else { "%" },
-            );
-            (left, right)
+            (
+                format!("{icon} {}", track.title),
+                if track.artist.is_empty() {
+                    String::new()
+                } else {
+                    track.artist.clone()
+                },
+                format!(
+                    "{} / {}",
+                    format_duration(t.position_ms),
+                    format_duration(t.duration_ms.max(track.duration_ms)),
+                ),
+            )
         }
         None => (
-            "nothing playing — Enter on a track to start".to_string(),
-            format!("vol {}%", t.volume),
+            "♪ nothing playing".to_string(),
+            "press i to search YouTube, Enter on a track to start".to_string(),
+            String::new(),
         ),
     };
-    let width = line_area.width as usize;
+    let width = title_area.width as usize;
     let right = fit(&right, width.saturating_sub(12).max(1));
     let right_width = right.width();
-    let left_max = width.saturating_sub(right_width + 1).max(8);
-    let left = fit(&left, left_max);
+    let title = fit(&title, width.saturating_sub(right_width + 1).max(8));
     let line = Line::from(vec![
-        Span::styled(left.clone(), Style::default().fg(NOW)),
-        Span::raw(" ".repeat(width.saturating_sub(left.width() + right_width))),
+        Span::styled(title.clone(), Style::default().fg(NOW)),
+        Span::raw(" ".repeat(width.saturating_sub(title.width() + right_width))),
         Span::styled(right, Style::default().fg(DIM)),
     ]);
-    frame.render_widget(Paragraph::new(line), line_area);
+    frame.render_widget(Paragraph::new(line), title_area);
+    frame.render_widget(
+        Paragraph::new(fit(&artist, width)).style(Style::default().fg(DIM)),
+        artist_area,
+    );
 
     let duration = t.duration_ms.max(1);
     let ratio = (t.position_ms as f64 / duration as f64).clamp(0.0, 1.0);
@@ -304,9 +555,13 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
         .label("");
     frame.render_widget(gauge, gauge_area);
 
-    let hints = "j/k move  Enter play  Space pause  n/p next/prev  a queue  A playlist  / filter  i download  ? help  q detach";
+    let hints = format!(
+        "j/k move  Enter play  Space pause  n/p next/prev  a queue  A playlist  / filter  i download  ? help   vol {}%{}",
+        t.volume,
+        if t.muted { " (muted)" } else { "" }
+    );
     frame.render_widget(
-        Paragraph::new(truncate(hints, hint_area.width as usize)).style(Style::default().fg(DIM)),
+        Paragraph::new(fit(&hints, hint_area.width as usize)).style(Style::default().fg(DIM)),
         hint_area,
     );
 }
@@ -339,11 +594,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_input(frame: &mut Frame, app: &App, kind: InputKind, buffer: &str, area: Rect) {
+fn draw_input(frame: &mut Frame, app: &App, kind: &InputKind, buffer: &str, area: Rect) {
     let (label, hint) = match kind {
         InputKind::Filter => ("filter", "Enter apply · Esc clear"),
         InputKind::NewPlaylist => ("new playlist", "Enter create · Esc cancel"),
         InputKind::Download => ("search / url", "Enter search or download · Esc cancel"),
+        InputKind::RenameTrack(_) => ("rename track", "Enter save · Esc cancel"),
+        InputKind::RenamePlaylist(_) => ("rename playlist", "Enter save · Esc cancel"),
     };
     let text = format!(" {label}: {buffer}▏  {hint}");
     frame.render_widget(
@@ -354,17 +611,70 @@ fn draw_input(frame: &mut Frame, app: &App, kind: InputKind, buffer: &str, area:
     let _ = app;
 }
 
+fn draw_delete(frame: &mut Frame, area: Rect, title: &str, choice: DeleteChoice) {
+    let popup = centered_abs(68, 10, area);
+    frame.render_widget(Clear, popup);
+    let option = |selected: bool, label: &str, detail: &str, destructive: bool| {
+        let marker = if selected { "▸ " } else { "  " };
+        let color = if destructive { DANGER } else { Color::Reset };
+        let style = if selected {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        Line::from(vec![
+            Span::styled(format!("{marker}{label:<26}"), style),
+            Span::styled(detail.to_string(), Style::default().fg(DIM)),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            truncate(title, 58),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        option(
+            choice == DeleteChoice::Melos,
+            "Remove from melos only",
+            "keep the audio file",
+            false,
+        ),
+        option(
+            choice == DeleteChoice::File,
+            "Delete the audio file",
+            "permanent, cannot be undone",
+            true,
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "j/k choose · Enter confirm · Esc cancel",
+            Style::default().fg(DIM),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_type(BorderType::Rounded).title(
+            Span::styled(
+                " Remove track ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        )),
+        popup,
+    );
+}
+
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.keys.help_rows();
     let half = rows.len().div_ceil(2);
-    let width = area.width.saturating_sub(6).min(82).max(40);
+    let width = area.width.saturating_sub(6).clamp(40, 82);
     let height = (half as u16 + 4).min(area.height);
     let popup = centered_abs(width, height, area);
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().title(Span::styled(
-        " Keys — press any key to close ",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ));
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            " Keys — press any key to close ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
     let mut lines: Vec<Line> = Vec::new();
     for i in 0..half {
         let mut spans = Vec::new();
@@ -443,12 +753,12 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect, index: usize) {
         .map(|p| ListItem::new(format!("{}  ({})", p.name, p.count)))
         .collect();
     let list = List::new(items)
-        .block(Block::bordered().title(" Add to playlist "))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Add to playlist "),
         )
+        .highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ");
     let mut state = ListState::default().with_selected(Some(index));
     frame.render_stateful_widget(list, popup, &mut state);
@@ -485,6 +795,7 @@ fn friendly(action: &str) -> String {
         "pane_playlists" => "playlists pane",
         "pane_queue" => "queue pane",
         "pane_downloads" => "downloads pane",
+        "pane_stats" => "statistics pane",
         "confirm" => "play / open",
         "pause" => "play-pause",
         "next" => "next track",
@@ -502,6 +813,8 @@ fn friendly(action: &str) -> String {
         "playlist_add" => "add to playlist",
         "new_playlist" => "new playlist",
         "remove" => "remove / cancel",
+        "delete_track" => "delete track",
+        "rename" => "rename",
         "filter" => "filter",
         "download" => "download / search",
         "playlist_delete" => "delete playlist",

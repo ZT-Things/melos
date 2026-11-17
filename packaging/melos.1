@@ -1,4 +1,4 @@
-.TH MELOS 1 "2026-11-17" "melos 0.1.0" "User Commands"
+.TH MELOS 1 "2026-11-17" "melos 0.2.0" "User Commands"
 .SH NAME
 melos \- fast, minimal terminal music player with YouTube downloads
 .SH SYNOPSIS
@@ -15,7 +15,8 @@ melos \- fast, minimal terminal music player with YouTube downloads
 is a terminal music player. It connects to the resident
 .BR melosd (1)
 daemon, starting it on demand, and displays a keyboard-driven interface for the
-library, playlists, queue, and downloads.
+library, playlists, queue, downloads, and listening statistics. The selected
+track's cover art appears in the sidebar when the file has embedded art.
 .PP
 The daemon owns playback and continues when the client exits. Press
 .B q
@@ -62,8 +63,9 @@ Move by half a page or a full page.
 .B Tab
 Switch between the sidebar and the main pane.
 .TP
-.BR 1 " " 2 " " 3 " " 4
-Open Library, Playlists, Queue, or Downloads.
+.BR 1 " " 2 " " 3 " " 4 " " 5
+Open Library, Playlists, Queue, Downloads, or Statistics. Opening the Library
+moves the cursor to the currently playing track.
 .TP
 .B Enter
 Play the selected track, open a playlist, or confirm an input.
@@ -102,8 +104,16 @@ Add the selected track to a playlist.
 Create a playlist.
 .TP
 .B d
-Remove the selected item from the queue or playlist, or cancel the selected
-download.
+Remove the selected item from the queue or playlist, cancel the selected
+download, or open the removal dialog on a Library track.
+.TP
+.B Delete
+Remove the selected track from the library. A dialog chooses between forgetting
+the track in melos only and deleting the downloaded audio file as well.
+.TP
+.BR e ", " F2
+Rename the selected playlist or track. This changes melos' display name only;
+audio tags and filenames are not modified.
 .TP
 .B i
 Download: enter a search query or a YouTube URL.
@@ -137,6 +147,9 @@ SQLite index of downloaded tracks and playlists.
 .I ~/.local/state/melos/state.json
 Queue, position, volume, shuffle, and repeat state.
 .TP
+.I ~/.cache/melos/art
+Extracted cover art cache.
+.TP
 .IR $XDG_RUNTIME_DIR /melos/daemon.sock
 Unix socket used by the client.
 .TP
@@ -152,6 +165,9 @@ Base directory for the library index.
 .TP
 .B XDG_STATE_HOME
 Base directory for persistent player state and logs.
+.TP
+.B XDG_CACHE_HOME
+Base directory for extracted cover art.
 .TP
 .B XDG_RUNTIME_DIR
 Base directory for the client socket. Falls back to
