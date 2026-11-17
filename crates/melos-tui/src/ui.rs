@@ -20,6 +20,7 @@ const SURFACE: Color = Color::Rgb(48, 44, 40);
 const DANGER: Color = Color::Rgb(207, 106, 94);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.poll_art();
     app.clamp_cursor();
     let area = frame.area();
     let [body, now, status] = Layout::vertical([

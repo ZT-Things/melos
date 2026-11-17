@@ -232,6 +232,11 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
                     }
                 }
             }
+            _ = tokio::time::sleep(Duration::from_millis(50)), if app.art_pending() => {
+                // The first frame should not wait for image decoding, so poll
+                // only while a background decode is outstanding.
+                terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            }
         }
     }
 

@@ -44,7 +44,7 @@ impl Db {
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS tracks (
-              id          INTEGER PRIMARY KEY,
+              id          INTEGER PRIMARY KEY AUTOINCREMENT,
               path        TEXT NOT NULL UNIQUE,
               yt_id       TEXT NOT NULL UNIQUE,
               title       TEXT NOT NULL,
@@ -90,6 +90,61 @@ impl Db {
             CREATE INDEX IF NOT EXISTS listening_day ON listening(day);
             "#,
         )?;
+        self.ensure_autoincrement()?;
+        Ok(())
+    }
+
+    /// Track ids are the long-term key for listening history, so they must
+    /// never be reused after a delete. Older databases used a plain rowid.
+    fn ensure_autoincrement(&self) -> Result<()> {
+        let sql: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='tracks'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if sql
+            .as_deref()
+            .is_none_or(|sql| sql.contains("AUTOINCREMENT"))
+        {
+            return Ok(());
+        }
+
+        self.conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let result = self.conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE tracks_new (
+               id          INTEGER PRIMARY KEY AUTOINCREMENT,
+               path        TEXT NOT NULL UNIQUE,
+               yt_id       TEXT NOT NULL UNIQUE,
+               title       TEXT NOT NULL,
+               artist      TEXT NOT NULL,
+               album       TEXT,
+               duration_ms INTEGER NOT NULL DEFAULT 0,
+               added_at    INTEGER NOT NULL,
+               last_played INTEGER,
+               play_count  INTEGER NOT NULL DEFAULT 0,
+               file_mtime  INTEGER NOT NULL DEFAULT 0,
+               missing     INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO tracks_new
+               (id, path, yt_id, title, artist, album, duration_ms, added_at,
+                last_played, play_count, file_mtime, missing)
+             SELECT id, path, yt_id, title, artist, album, duration_ms, added_at,
+                    last_played, play_count, file_mtime, missing
+             FROM tracks;
+             DROP TABLE tracks;
+             ALTER TABLE tracks_new RENAME TO tracks;
+             CREATE INDEX IF NOT EXISTS tracks_title ON tracks(title);
+             COMMIT;",
+        );
+        self.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        if let Err(error) = result {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -350,8 +405,10 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT artist, SUM(played_ms) AS total FROM listening
-             GROUP BY artist ORDER BY total DESC, artist COLLATE NOCASE LIMIT 5",
+            "SELECT listening.artist, SUM(listening.played_ms) AS total
+             FROM listening JOIN tracks ON tracks.id = listening.track_id
+             GROUP BY listening.artist
+             ORDER BY total DESC, listening.artist COLLATE NOCASE LIMIT 5",
         )?;
         let top_artists = stmt
             .query_map([], |r| {
@@ -363,8 +420,10 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT title, artist, SUM(played_ms) AS total FROM listening
-             GROUP BY title, artist ORDER BY total DESC, title COLLATE NOCASE LIMIT 5",
+            "SELECT listening.title, listening.artist, SUM(listening.played_ms) AS total
+             FROM listening JOIN tracks ON tracks.id = listening.track_id
+             GROUP BY listening.title, listening.artist
+             ORDER BY total DESC, listening.title COLLATE NOCASE LIMIT 5",
         )?;
         let top_tracks = stmt
             .query_map([], |r| {
@@ -419,7 +478,7 @@ mod tests {
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;
              CREATE TABLE tracks (
-               id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, yt_id TEXT NOT NULL UNIQUE,
+               id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, yt_id TEXT NOT NULL UNIQUE,
                title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
                duration_ms INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL,
                last_played INTEGER, play_count INTEGER NOT NULL DEFAULT 0,
@@ -495,6 +554,95 @@ mod tests {
         assert!(db.track(id).unwrap().is_none());
         assert!(db.playlist_tracks(pl).unwrap().is_empty());
         assert_eq!(db.stats().unwrap().total_ms, 12_000);
+    }
+
+    #[test]
+    fn deleted_tracks_are_hidden_from_top_lists_but_stay_in_totals() {
+        let db = mem_db();
+        let id = db.insert(&track("a")).unwrap();
+        db.add_listening(id, "a", "Artist", 12_000).unwrap();
+        db.delete_track(id).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.total_ms, 12_000);
+        assert!(stats.top_artists.is_empty());
+        assert!(stats.top_tracks.is_empty());
+    }
+
+    #[test]
+    fn track_ids_are_not_reused_after_deleting_the_newest_one() {
+        let db = mem_db();
+        let first = db.insert(&track("a")).unwrap();
+        db.add_listening(first, "a", "Artist", 3_000).unwrap();
+        db.delete_track(first).unwrap();
+        let second = db.insert(&track("b")).unwrap();
+        assert_ne!(first, second);
+        db.add_listening(second, "b", "Artist B", 2_000).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.total_ms, 5_000);
+        assert_eq!(stats.top_tracks.len(), 1);
+        assert_eq!(stats.top_tracks[0].title, "b");
+    }
+
+    #[test]
+    fn migration_makes_track_ids_monotonic() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tracks (
+               id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, yt_id TEXT NOT NULL UNIQUE,
+               title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
+               duration_ms INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL,
+               last_played INTEGER, play_count INTEGER NOT NULL DEFAULT 0,
+               file_mtime INTEGER NOT NULL DEFAULT 0, missing INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE playlists (
+               id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+               created_at INTEGER NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE playlist_tracks (
+               playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+               track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+               position INTEGER NOT NULL, PRIMARY KEY (playlist_id, position),
+               UNIQUE (playlist_id, track_id));
+             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE listening (
+               day TEXT NOT NULL, track_id INTEGER NOT NULL,
+               title TEXT NOT NULL, artist TEXT NOT NULL,
+               played_ms INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (day, track_id));",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tracks
+               (id, path, yt_id, title, artist, added_at)
+             VALUES (42, '/tmp/old.opus', 'old', 'old', 'Artist', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlists (id, name, created_at) VALUES (1, 'Old', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (1, 42, 0)",
+            [],
+        )
+        .unwrap();
+        let db = Db { conn };
+        db.migrate().unwrap();
+        assert!(db.track(42).unwrap().is_some());
+        assert_eq!(db.playlist_tracks(1).unwrap()[0].id, 42);
+        let first = db.insert(&track("a")).unwrap();
+        db.delete_track(first).unwrap();
+        let second = db.insert(&track("b")).unwrap();
+        assert_ne!(first, second);
+        let sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("AUTOINCREMENT"));
     }
 
     #[test]

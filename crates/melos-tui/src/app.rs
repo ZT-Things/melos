@@ -1,5 +1,7 @@
 //! Client-local UI state: view, cursors, filter, input prompts, overlays.
 
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use melos_proto::{
     Action, DownloadState, ServerMsg, TrackRow, ViewModel, format_duration, truncate,
@@ -89,6 +91,7 @@ pub struct App {
     pub picker: Option<Picker>,
     pub art: Option<StatefulProtocol>,
     art_path: Option<String>,
+    art_rx: Option<Receiver<(String, StatefulProtocol)>>,
 }
 
 const SIDEBAR_VIEWS: [View; 5] = [
@@ -102,6 +105,7 @@ const SIDEBAR_VIEWS: [View; 5] = [
 impl App {
     pub fn new(vm: ViewModel, keys: KeyMap) -> Self {
         let daemon_version = vm.daemon_version.clone();
+        let art_path = vm.transport.art_path.clone();
         let mut app = Self {
             vm,
             view: View::Library,
@@ -118,7 +122,8 @@ impl App {
             daemon_version,
             picker: None,
             art: None,
-            art_path: None,
+            art_path,
+            art_rx: None,
         };
         app.reveal_current();
         app
@@ -135,15 +140,45 @@ impl App {
         }
         self.art_path = path;
         self.art = None;
+        self.art_rx = None;
         self.load_art();
     }
 
     fn load_art(&mut self) {
-        let (Some(path), Some(picker)) = (self.art_path.as_deref(), self.picker.as_ref()) else {
+        let (Some(path), Some(picker)) = (self.art_path.clone(), self.picker.clone()) else {
             return;
         };
-        if let Ok(image) = image::open(path) {
-            self.art = Some(picker.new_resize_protocol(image));
+        let (tx, rx) = mpsc::channel();
+        self.art_rx = Some(rx);
+        std::thread::spawn(move || {
+            if let Ok(image) = image::open(&path) {
+                let protocol = picker.new_resize_protocol(image);
+                let _ = tx.send((path, protocol));
+            }
+        });
+    }
+
+    pub fn art_pending(&self) -> bool {
+        self.art_rx.is_some()
+    }
+
+    /// Apply a finished background decode. Called from the draw path so the
+    /// event loop never waits on image decoding.
+    pub fn poll_art(&mut self) {
+        let Some(rx) = self.art_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((path, protocol)) => {
+                if self.art_path.as_deref() == Some(path.as_str()) {
+                    self.art = Some(protocol);
+                }
+                self.art_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.art_rx = None;
+            }
         }
     }
 
@@ -951,5 +986,36 @@ mod tests {
         let actions = app.on_key(key(KeyCode::Char('5')));
         assert_eq!(app.view, View::Stats);
         assert!(matches!(actions.as_slice(), [Action::RequestStats]));
+    }
+
+    #[test]
+    fn initial_snapshot_art_is_kept_and_decoded_off_the_event_loop() {
+        let dir = std::env::temp_dir().join(format!("melos-art-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cover.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([214, 168, 95]))
+            .save(&path)
+            .unwrap();
+        let art = path.to_string_lossy().into_owned();
+
+        let mut vm = ViewModel::default();
+        vm.transport.art_path = Some(art.clone());
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+        assert_eq!(app.art_path.as_deref(), Some(art.as_str()));
+        app.set_picker(Picker::halfblocks());
+        assert!(app.art_pending(), "decode is queued off-thread");
+        for _ in 0..100 {
+            app.poll_art();
+            if app.art.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.art.is_some(), "background art decode completed");
+        assert!(!app.art_pending(), "decode queue is drained");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

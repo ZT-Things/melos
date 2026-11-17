@@ -81,18 +81,34 @@ pub async fn connect(spawn: bool) -> Result<(ClientHandle, ViewModel)> {
         .as_ref()
         .is_some_and(|error| error.downcast_ref::<ProtocolMismatch>().is_some())
     {
-        let _ = retire_legacy(&path).await;
+        retire_legacy(&path).await;
     }
 
-    spawn_daemon()?;
+    // Socket activation may already own the socket, so a bind error here is
+    // not fatal: the retry loop below can still wake the real service.
+    let spawn_error = spawn_daemon().err();
+    let mut saw_mismatch = false;
 
     for _ in 0..200 {
-        if let Ok(pair) = connect_once(&path).await {
-            return Ok(pair);
+        match connect_once(&path).await {
+            Ok(pair) => return Ok(pair),
+            Err(error) => {
+                if error.downcast_ref::<ProtocolMismatch>().is_some() {
+                    saw_mismatch = true;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
+    if saw_mismatch {
+        bail!(
+            "an older melosd (protocol {LEGACY_PROTOCOL}) is still running — run `melos stop`, then start melos again"
+        );
+    }
+    if let Some(error) = spawn_error {
+        return Err(error.context(format!("could not connect to melosd at {}", path.display())));
+    }
     bail!(
         "could not connect to melosd at {} — try running `melosd` to see the error",
         path.display()
@@ -126,10 +142,24 @@ async fn retire_legacy(path: &Path) -> bool {
         return false;
     };
     let _ = handle.tx.send(Action::Shutdown);
-    for _ in 0..100 {
+    for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        if UnixStream::connect(path).await.is_err() {
-            return true;
+        match connect_once_with_protocol(path, LEGACY_PROTOCOL).await {
+            // Still the old daemon; give mpv and the daemon time to exit.
+            Ok(_) => {}
+            Err(error) => {
+                if error
+                    .downcast_ref::<ProtocolMismatch>()
+                    .is_some_and(|mismatch| mismatch.daemon == Some(PROTOCOL_VERSION))
+                {
+                    // Socket activation started the new daemon while the old
+                    // listener stayed in place; the upgrade is complete.
+                    return true;
+                }
+                if UnixStream::connect(path).await.is_err() {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -312,6 +342,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<ProtocolMismatch>().is_some());
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn retire_waits_for_a_slow_legacy_daemon_to_exit() {
+        let path = std::env::temp_dir().join(format!(
+            "melos-client-test-retire-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let hello = lines.next_line().await.unwrap().unwrap();
+            let hello: ClientMsg = serde_json::from_str(&hello).unwrap();
+            assert!(matches!(hello, ClientMsg::Hello { protocol: 1, .. }));
+            let reply = serde_json::to_string(&ServerMsg::Welcome {
+                protocol: 1,
+                daemon_version: "0.1.0".into(),
+                snapshot: ViewModel::default(),
+            })
+            .unwrap();
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+            let action = lines.next_line().await.unwrap().unwrap();
+            let action: ClientMsg = serde_json::from_str(&action).unwrap();
+            assert!(matches!(
+                action,
+                ClientMsg::Action {
+                    action: Action::Shutdown
+                }
+            ));
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            drop(listener);
+        });
+
+        assert!(retire_legacy(&path).await);
         server.await.unwrap();
         let _ = std::fs::remove_file(&path);
     }

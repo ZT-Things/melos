@@ -58,6 +58,7 @@ pub struct Daemon {
     mpris: Option<Arc<Server<Mpris>>>,
     mpris_info: Option<Arc<Mutex<Info>>>,
     listening: ListenTracker,
+    last_listen_flush: Instant,
     art_path: Option<String>,
     art_track: Option<i64>,
 }
@@ -121,6 +122,7 @@ impl Daemon {
             mpris: None,
             mpris_info: None,
             listening: ListenTracker::new(),
+            last_listen_flush: Instant::now(),
             art_path: None,
             art_track: None,
         }
@@ -145,7 +147,7 @@ impl Daemon {
     }
 
     fn flush_listening(&mut self) {
-        if let Some(entry) = self.listening.take()
+        if let Some(entry) = self.listening.split()
             && let Err(e) =
                 self.db
                     .add_listening(entry.track_id, &entry.title, &entry.artist, entry.ms)
@@ -215,6 +217,15 @@ impl Daemon {
             }
             Internal::Tick => {
                 self.listen_tick();
+                let now = Instant::now();
+                if self.player.playing
+                    && self.player.is_loaded()
+                    && listen_flush_due(self.last_listen_flush, now)
+                {
+                    self.flush_listening();
+                    self.last_listen_flush = now;
+                    self.transport_dirty = true;
+                }
                 self.sync_mpris();
                 if self.transport_dirty && !self.clients.is_empty() {
                     let transport = self.transport();
@@ -970,9 +981,23 @@ impl ListenTracker {
         old.filter(|entry| entry.ms > 0)
     }
 
-    fn take(&mut self) -> Option<ListenEntry> {
-        self.entry.take().filter(|entry| entry.ms > 0)
+    /// Return the time accumulated so far without forgetting which track is
+    /// playing, so the next tick continues the same entry.
+    fn split(&mut self) -> Option<ListenEntry> {
+        let entry = self.entry.as_mut()?;
+        if entry.ms == 0 {
+            return None;
+        }
+        let flushed = entry.clone();
+        entry.ms = 0;
+        Some(flushed)
     }
+}
+
+const LISTEN_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+fn listen_flush_due(last: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last) >= LISTEN_FLUSH_INTERVAL
 }
 
 #[cfg(test)]
@@ -1021,9 +1046,90 @@ mod tests {
         assert_eq!(flushed.track_id, 1);
         assert_eq!(flushed.ms, 2_000);
         tracker.advance(start + Duration::from_secs(4), info(2));
-        let flushed = tracker.take().expect("shutdown flushes the last track");
+        let flushed = tracker.split().expect("shutdown flushes the last track");
         assert_eq!(flushed.track_id, 2);
         assert_eq!(flushed.ms, 2_000);
+    }
+
+    #[test]
+    fn periodic_flush_keeps_the_active_track_and_never_loses_elapsed_time() {
+        let start = Instant::now();
+        let mut tracker = ListenTracker::new_at(start);
+        tracker.advance(start, info(1));
+        tracker.advance(start + Duration::from_secs(5), info(1));
+        let flushed = tracker.split().expect("30s tick flushes");
+        assert_eq!(flushed.track_id, 1);
+        assert_eq!(flushed.ms, 5_000);
+        assert!(tracker.split().is_none(), "nothing new since the flush");
+
+        tracker.advance(start + Duration::from_secs(7), info(1));
+        let flushed = tracker.split().expect("second tick flushes the remainder");
+        assert_eq!(flushed.track_id, 1);
+        assert_eq!(flushed.ms, 2_000);
+    }
+
+    #[test]
+    fn listening_flush_is_due_after_thirty_seconds() {
+        let start = Instant::now();
+        assert!(!listen_flush_due(start, start + Duration::from_secs(29)));
+        assert!(listen_flush_due(start, start + Duration::from_secs(30)));
+    }
+
+    fn test_daemon(name: &str) -> (Daemon, PathBuf) {
+        let base = std::env::temp_dir().join(format!("melos-state-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("music")).unwrap();
+        let cfg = Config {
+            music_dir: base.join("music").display().to_string(),
+            ..Config::default()
+        };
+        let db = Db::open(&base.join("library.db")).unwrap();
+        let player = Player::new(None, 70, false, Repeat::Off);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let daemon = Daemon {
+            cfg: Arc::new(cfg),
+            db,
+            player,
+            tracks: Vec::new(),
+            playlists: Vec::new(),
+            playlist_tracks: Vec::new(),
+            selected_playlist: None,
+            downloads: Vec::new(),
+            jobs: HashMap::new(),
+            next_job: 1,
+            yt_results: Vec::new(),
+            clients: Vec::new(),
+            tx,
+            sem: Arc::new(Semaphore::new(1)),
+            status: "test".into(),
+            transport_dirty: false,
+            last_persist: Instant::now(),
+            mpris: None,
+            mpris_info: None,
+            listening: ListenTracker::new(),
+            last_listen_flush: Instant::now(),
+            art_path: None,
+            art_track: None,
+        };
+        (daemon, base)
+    }
+
+    fn insert_file(daemon: &Daemon, name: &str) -> (i64, PathBuf) {
+        let path = daemon.cfg.music_dir_path().join(format!("{name}.opus"));
+        std::fs::write(&path, b"audio").unwrap();
+        let id = daemon
+            .db
+            .insert(&crate::db::NewTrack {
+                path: path.display().to_string(),
+                yt_id: name.into(),
+                title: name.into(),
+                artist: "Artist".into(),
+                album: None,
+                duration_ms: 60_000,
+                mtime: 1,
+            })
+            .unwrap();
+        (id, path)
     }
 
     #[test]
@@ -1039,6 +1145,119 @@ mod tests {
         let outside = std::fs::canonicalize(base.join("outside.opus")).unwrap();
         assert!(file_within(&music, &inside));
         assert!(!file_within(&music, &outside));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_action_removes_the_file_membership_and_queue_entry() {
+        let (mut daemon, base) = test_daemon("delete");
+        let (id, path) = insert_file(&daemon, "a");
+        let playlist = daemon.db.create_playlist("Favorites").unwrap();
+        daemon.db.add_to_playlist(playlist, id).unwrap();
+        daemon.player.play_track(id, &[id], &daemon.db).unwrap();
+
+        daemon
+            .apply(Action::DeleteTrack {
+                track_id: id,
+                delete_file: true,
+            })
+            .unwrap();
+
+        assert!(!path.exists());
+        assert!(daemon.db.track(id).unwrap().is_none());
+        assert!(daemon.db.playlist_tracks(playlist).unwrap().is_empty());
+        assert!(daemon.player.queue.is_empty());
+        assert_eq!(daemon.player.current_id(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_action_refuses_outside_and_missing_files_without_forgetting_the_track() {
+        let (mut daemon, base) = test_daemon("delete-guard");
+        let outside = base.join("outside.opus");
+        std::fs::write(&outside, b"audio").unwrap();
+        let id = daemon
+            .db
+            .insert(&crate::db::NewTrack {
+                path: outside.display().to_string(),
+                yt_id: "outside".into(),
+                title: "outside".into(),
+                artist: "Artist".into(),
+                album: None,
+                duration_ms: 1,
+                mtime: 1,
+            })
+            .unwrap();
+        assert!(
+            daemon
+                .apply(Action::DeleteTrack {
+                    track_id: id,
+                    delete_file: true,
+                })
+                .is_err()
+        );
+        assert!(outside.exists());
+        assert!(daemon.db.track(id).unwrap().is_some());
+
+        let missing = daemon.cfg.music_dir_path().join("missing.opus");
+        let id = daemon
+            .db
+            .insert(&crate::db::NewTrack {
+                path: missing.display().to_string(),
+                yt_id: "missing".into(),
+                title: "missing".into(),
+                artist: "Artist".into(),
+                album: None,
+                duration_ms: 1,
+                mtime: 1,
+            })
+            .unwrap();
+        assert!(
+            daemon
+                .apply(Action::DeleteTrack {
+                    track_id: id,
+                    delete_file: true,
+                })
+                .is_err()
+        );
+        assert!(daemon.db.track(id).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn file_loaded_does_not_undo_a_user_pause() {
+        let (mut daemon, base) = test_daemon("paused");
+        let (id, _) = insert_file(&daemon, "a");
+        daemon.player.play_track(id, &[id], &daemon.db).unwrap();
+        daemon.player.set_playing(false);
+        assert!(!daemon.player.playing);
+        daemon.on_mpv(MpvEvent::FileLoaded).unwrap();
+        assert!(daemon.player.is_loaded());
+        assert!(!daemon.player.playing);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn tick_flushes_listening_every_thirty_seconds() {
+        let (mut daemon, base) = test_daemon("flush");
+        let (id, _) = insert_file(&daemon, "a");
+        daemon.player.play_track(id, &[id], &daemon.db).unwrap();
+        daemon.listening = ListenTracker {
+            last: Instant::now(),
+            entry: Some(ListenEntry {
+                track_id: id,
+                title: "a".into(),
+                artist: "Artist".into(),
+                ms: 30_000,
+            }),
+        };
+        daemon.last_listen_flush = Instant::now() - Duration::from_secs(31);
+
+        daemon.handle(Internal::Tick).await;
+
+        let stats = daemon.db.stats().unwrap();
+        assert!(stats.total_ms >= 30_000);
+        assert_eq!(daemon.listening.entry.as_ref().unwrap().ms, 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
