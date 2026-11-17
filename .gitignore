@@ -8,3 +8,6 @@ packaging/**/src/
 *.tar.gz
 .idea
 .vscode
+
+# superpowers scratch
+/.superpowers/

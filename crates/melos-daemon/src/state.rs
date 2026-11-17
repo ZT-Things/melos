@@ -428,12 +428,16 @@ impl Daemon {
                 self.player.set_loaded(true);
             }
             MpvEvent::EndFile { reason } => {
-                self.player.set_loaded(false);
-                if reason == "eof" {
-                    let was_playing = self.player.playing;
-                    self.player.on_eof(&self.db)?;
-                    if was_playing {
-                        self.status = self.now_playing_status();
+                // `stop`/`redirect` are emitted when mpv replaces a file;
+                // they are not the end of playback.
+                if let Some(was_playing) = self.player.file_ended(&reason) {
+                    if reason == "eof" {
+                        self.player.on_eof(&self.db)?;
+                        if was_playing {
+                            self.status = self.now_playing_status();
+                        }
+                    } else {
+                        self.status = "playback error".into();
                     }
                     self.broadcast_state();
                 }

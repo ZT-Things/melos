@@ -66,6 +66,21 @@ impl Player {
         }
     }
 
+    /// Handle an mpv `end-file` reason.
+    ///
+    /// mpv emits `stop` whenever a file is replaced with `loadfile ...
+    /// replace`, so treating every end-file as the end of playback makes the
+    /// daemon claim it is paused while mpv keeps playing. Returns the play
+    /// state before a real end (`eof` / `error`), or `None` for a replacement.
+    pub fn file_ended(&mut self, reason: &str) -> Option<bool> {
+        if !matches!(reason, "eof" | "error") {
+            return None;
+        }
+        let was_playing = self.playing;
+        self.set_loaded(false);
+        Some(was_playing)
+    }
+
     /// Replace the queue with `context`, selecting `track_id`.
     pub fn play_track(&mut self, track_id: i64, context: &[i64], db: &Db) -> Result<()> {
         let queue: Vec<i64> = if context.contains(&track_id) {
@@ -364,5 +379,47 @@ mod tests {
         let mut sorted = items.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..200).collect::<Vec<_>>());
+    }
+
+    fn loaded_player() -> Player {
+        let mut player = Player::new(None, 70, false, Repeat::Off);
+        player.pos = Some(0);
+        player.queue = vec![1];
+        player.loaded = true;
+        player.playing = true;
+        player
+    }
+
+    #[test]
+    fn replacing_a_file_does_not_count_as_the_end_of_playback() {
+        let mut player = loaded_player();
+        assert_eq!(player.file_ended("stop"), None);
+        assert!(player.playing, "audio keeps playing during a file replace");
+        assert!(player.is_loaded());
+        assert_eq!(player.current_id(), Some(1));
+    }
+
+    #[test]
+    fn eof_is_a_real_end_and_reports_the_previous_play_state() {
+        let mut player = loaded_player();
+        assert_eq!(player.file_ended("eof"), Some(true));
+        assert!(!player.playing);
+        assert!(!player.is_loaded());
+    }
+
+    #[test]
+    fn a_redirect_does_not_clear_playback() {
+        let mut player = loaded_player();
+        assert_eq!(player.file_ended("redirect"), None);
+        assert!(player.playing);
+    }
+
+    #[test]
+    fn a_paused_end_reports_paused_and_clears_loaded() {
+        let mut player = loaded_player();
+        player.set_playing(false);
+        assert_eq!(player.file_ended("eof"), Some(false));
+        assert!(!player.playing);
+        assert!(!player.is_loaded());
     }
 }
