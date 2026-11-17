@@ -1,0 +1,7 @@
+#compdef melosd
+
+_arguments -s \
+    '--config[Path to config.toml]:config file:_files' \
+    '--music-dir[Override the music directory]:directory:_directories' \
+    '(-h --help)'{-h,--help}'[Show help]' \
+    '(-V --version)'{-V,--version}'[Show version]'

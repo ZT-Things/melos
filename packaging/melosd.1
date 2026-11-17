@@ -1,0 +1,103 @@
+.TH MELOSD 1 "2026-11-17" "melos 0.1.0" "User Commands"
+.SH NAME
+melosd \- resident daemon for the melos music player
+.SH SYNOPSIS
+.B melosd
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B melosd
+owns playback, the library index, media downloads, and the MPRIS interface for
+.BR melos (1).
+It listens on a Unix socket and accepts newline-delimited JSON commands from
+clients.
+.PP
+Normally the TUI starts the daemon on demand. It can also be started by systemd
+socket activation with the user unit
+.IR melos.socket ,
+or directly. One instance per user is supported.
+.PP
+The daemon spawns a warm
+.BR mpv (1)
+process, so the first track starts without waiting for a player to boot.
+Playback continues when all clients detach. The daemon exits when it receives
+.B Shutdown
+from a client, SIGTERM, or SIGINT.
+.SH OPTIONS
+.TP
+.BI \-\-config " PATH"
+Read configuration from
+.IR PATH
+instead of
+.IR $XDG_CONFIG_HOME/melos/config.toml .
+.TP
+.BI \-\-music\-dir " DIR"
+Override the configured download directory.
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH SYSTEMD
+The package provides
+.I melos.socket
+and
+.I melos.service
+as user units. Enable socket activation with:
+.PP
+.nf
+.RS
+systemctl \-\-user enable \-\-now melos.socket
+.RE
+.fi
+.PP
+The units are not enabled automatically. Without them, the TUI starts
+.B melosd
+itself and writes its output to
+.IR ~/.local/state/melos/daemon.log .
+.SH FILES
+.TP
+.I ~/.config/melos/config.toml
+Configuration, including download and mpv options.
+.TP
+.I ~/.local/share/melos/library.db
+SQLite index. Audio files are the source of truth; the index can be deleted
+and rebuilt by downloading tracks again.
+.TP
+.I ~/.local/state/melos/state.json
+Persisted queue, position, volume, shuffle, and repeat state. Written
+atomically on track changes and periodically while playing.
+.TP
+.I ~/.local/state/melos/daemon.log
+Output from a daemon spawned by the TUI.
+.TP
+.I ~/.local/state/melos/download\-N.log
+yt-dlp stderr for each download job, kept for troubleshooting.
+.TP
+.IR $XDG_RUNTIME_DIR /melos/daemon.sock
+Client socket, mode 0600.
+.TP
+.IR $XDG_RUNTIME_DIR /melos/mpv.sock
+Private mpv IPC socket.
+.SH ENVIRONMENT
+.TP
+.B LISTEN_FDS " / " LISTEN_PID
+Used by systemd socket activation. When exactly one socket is passed, the
+daemon uses it instead of binding its own.
+.TP
+.B RUST_LOG
+Log filter, for example
+.BR melosd=debug .
+.TP
+.B XDG_CONFIG_HOME ", " XDG_DATA_HOME ", " XDG_STATE_HOME ", " XDG_RUNTIME_DIR
+XDG base directories.
+.SH EXIT STATUS
+Zero on clean shutdown, non-zero if the socket cannot be bound, the database
+cannot be opened, or another instance is already running.
+.SH SEE ALSO
+.BR melos (1),
+.BR mpv (1),
+.BR yt\-dlp (1),
+.BR systemd.socket (5)
+.SH BUGS
+Report bugs at https://github.com/ZT-Things/melos/issues.

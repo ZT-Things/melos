@@ -1,0 +1,6 @@
+complete -c melos -s h -l help -d 'Show help'
+complete -c melos -s V -l version -d 'Show version'
+complete -c melos -l config -r -F -d 'Path to config.toml'
+complete -c melos -l trace-startup -d 'Print startup timings after the UI exits'
+complete -c melos -n '__fish_use_subcommand' -a status -d 'Show whether the daemon is running'
+complete -c melos -n '__fish_use_subcommand' -a stop -d 'Stop playback and shut down the daemon'

@@ -1,0 +1,10 @@
+/target
+/dist
+/.opencode
+/.playwright-mcp/
+packaging/**/pkg/
+packaging/**/src/
+*.pkg.tar.zst
+*.tar.gz
+.idea
+.vscode

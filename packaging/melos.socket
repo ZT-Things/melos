@@ -1,0 +1,12 @@
+[Unit]
+Description=melos music player socket
+Documentation=man:melosd(1) man:melos(1)
+
+[Socket]
+ListenStream=%t/melos/daemon.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

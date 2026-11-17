@@ -1,0 +1,48 @@
+# Maintainer: ZT <ztthingsgm@gmail.com>
+pkgname=melos
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fast, minimal TUI music player with YouTube downloads"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ZT-Things/melos"
+license=('MIT')
+depends=('gcc-libs' 'mpv' 'sqlite' 'yt-dlp')
+makedepends=('cargo' 'pkgconf' 'rust')
+optdepends=('ffmpeg: audio extraction and thumbnail embedding for yt-dlp')
+provides=('melos')
+conflicts=('melos-bin' 'melos-git')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# TODO: replace SKIP with the sha256 of the tagged GitHub tarball before
+# uploading to the AUR. `updpkgsums` after the tag exists.
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    export CARGO_TARGET_DIR=target
+    cargo build --release --locked --workspace
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 target/release/melos "$pkgdir/usr/bin/melos"
+    install -Dm755 target/release/melosd "$pkgdir/usr/bin/melosd"
+
+    install -Dm644 packaging/melos.socket "$pkgdir/usr/lib/systemd/user/melos.socket"
+    install -Dm644 packaging/melos.service "$pkgdir/usr/lib/systemd/user/melos.service"
+
+    install -Dm644 packaging/melos.1 "$pkgdir/usr/share/man/man1/melos.1"
+    install -Dm644 packaging/melosd.1 "$pkgdir/usr/share/man/man1/melosd.1"
+    gzip -9n "$pkgdir/usr/share/man/man1/melos.1" "$pkgdir/usr/share/man/man1/melosd.1"
+
+    install -Dm644 packaging/completions/melos.bash "$pkgdir/usr/share/bash-completion/completions/melos"
+    install -Dm644 packaging/completions/melosd.bash "$pkgdir/usr/share/bash-completion/completions/melosd"
+    install -Dm644 packaging/completions/_melos "$pkgdir/usr/share/zsh/site-functions/_melos"
+    install -Dm644 packaging/completions/_melosd "$pkgdir/usr/share/zsh/site-functions/_melosd"
+    install -Dm644 packaging/completions/melos.fish "$pkgdir/usr/share/fish/vendor_completions.d/melos.fish"
+    install -Dm644 packaging/completions/melosd.fish "$pkgdir/usr/share/fish/vendor_completions.d/melosd.fish"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 config.toml.example "$pkgdir/usr/share/doc/$pkgname/config.toml.example"
+}

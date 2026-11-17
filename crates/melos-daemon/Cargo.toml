@@ -1,0 +1,24 @@
+[package]
+name = "melos-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resident daemon for melos: playback, library, downloads, MPRIS"
+
+[[bin]]
+name = "melosd"
+path = "src/main.rs"
+
+[dependencies]
+melos-proto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+lofty.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+mpris-server.workspace = true
+clap.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "melos-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fast minimal TUI client for melos"
+
+[[bin]]
+name = "melos"
+path = "src/main.rs"
+
+[dependencies]
+melos-proto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true

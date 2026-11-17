@@ -1,0 +1,16 @@
+[Unit]
+Description=melos music player daemon
+Documentation=man:melosd(1) man:melos(1)
+Requires=melos.socket
+After=melos.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/melosd
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+# The daemon only touches the user's own music, state, and runtime files.
+NoNewPrivileges=yes
+PrivateTmp=yes

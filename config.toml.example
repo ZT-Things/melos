@@ -1,0 +1,20 @@
+# Example melos configuration.
+# Copy to ~/.config/melos/config.toml and edit what you need.
+
+music_dir = "~/Music/melos"
+audio_format = "opus"          # "opus" or "m4a"
+concurrent_downloads = 3       # 1-5
+
+[download]
+cookies_from_browser = ""      # e.g. "firefox"
+proxy = ""                     # e.g. "socks5://127.0.0.1:1080"
+extra_args = []                # extra yt-dlp arguments
+
+[mpv]
+extra_args = []                # extra mpv arguments
+
+# [keys]
+# down = ["j", "down"]
+# up = ["k", "up"]
+# quit = ["q", "ctrl+c"]
+# shutdown = ["Q"]

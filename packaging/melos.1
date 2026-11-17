@@ -1,0 +1,189 @@
+.TH MELOS 1 "2026-11-17" "melos 0.1.0" "User Commands"
+.SH NAME
+melos \- fast, minimal terminal music player with YouTube downloads
+.SH SYNOPSIS
+.B melos
+[\fIOPTIONS\fR]
+.br
+.B melos
+.B status
+.br
+.B melos
+.B stop
+.SH DESCRIPTION
+.B melos
+is a terminal music player. It connects to the resident
+.BR melosd (1)
+daemon, starting it on demand, and displays a keyboard-driven interface for the
+library, playlists, queue, and downloads.
+.PP
+The daemon owns playback and continues when the client exits. Press
+.B q
+to detach and leave music playing, or
+.B Q
+to stop playback and shut the daemon down.
+.SH OPTIONS
+.TP
+.BI \-\-config " PATH"
+Read configuration from
+.IR PATH
+instead of
+.IR $XDG_CONFIG_HOME/melos/config.toml .
+.TP
+.B \-\-trace\-startup
+Print first-frame and connection timings to standard error after the interface
+exits.
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH COMMANDS
+.TP
+.B status
+Print whether the daemon is running, the library and queue size, and the
+current track.
+.TP
+.B stop
+Ask the daemon to stop playback and exit.
+.SH KEY BINDINGS
+Navigation accepts both vim keys and the usual arrow keys.
+.TP
+.B j k, Down Up
+Move the selection down or up.
+.TP
+.B g G, Home End
+Jump to the first or last item.
+.TP
+.BR Ctrl+d ", " Ctrl+u ", " PgDn ", " PgUp
+Move by half a page or a full page.
+.TP
+.B Tab
+Switch between the sidebar and the main pane.
+.TP
+.BR 1 " " 2 " " 3 " " 4
+Open Library, Playlists, Queue, or Downloads.
+.TP
+.B Enter
+Play the selected track, open a playlist, or confirm an input.
+.TP
+.B Space
+Pause or resume.
+.TP
+.B n p
+Next or previous track.
+.TP
+.B Left Right
+Seek backward or forward five seconds.
+.TP
+.B Shift+Left Shift+Right
+Seek backward or forward thirty seconds.
+.TP
+.B + \-
+Change the volume.
+.TP
+.B m
+Toggle mute.
+.TP
+.B s
+Toggle shuffle.
+.TP
+.B r
+Cycle repeat mode.
+.TP
+.B a
+Add the selected track to the queue.
+.TP
+.B A
+Add the selected track to a playlist.
+.TP
+.B N
+Create a playlist.
+.TP
+.B d
+Remove the selected item from the queue or playlist, or cancel the selected
+download.
+.TP
+.B i
+Download: enter a search query or a YouTube URL.
+.TP
+.B /
+Filter the current list.
+.TP
+.B ?
+Show the help overlay.
+.TP
+.BR q ", " Ctrl+c
+Detach from the daemon; playback continues.
+.TP
+.B Q
+Stop playback and shut down the daemon.
+.TP
+.B Esc
+Cancel the current input or close an overlay.
+.PP
+Bindings can be changed in
+.IR config.toml ;
+the help overlay reflects the active keymap.
+.SH FILES
+.TP
+.I ~/.config/melos/config.toml
+Configuration.
+.TP
+.I ~/.local/share/melos/library.db
+SQLite index of downloaded tracks and playlists.
+.TP
+.I ~/.local/state/melos/state.json
+Queue, position, volume, shuffle, and repeat state.
+.TP
+.IR $XDG_RUNTIME_DIR /melos/daemon.sock
+Unix socket used by the client.
+.TP
+.I ~/Music/melos
+Default download directory.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the configuration.
+.TP
+.B XDG_DATA_HOME
+Base directory for the library index.
+.TP
+.B XDG_STATE_HOME
+Base directory for persistent player state and logs.
+.TP
+.B XDG_RUNTIME_DIR
+Base directory for the client socket. Falls back to
+.IR /tmp/melos\-UID .
+.SH EXAMPLES
+Open the player:
+.PP
+.nf
+.RS
+melos
+.RE
+.fi
+.PP
+Check what is playing without opening the interface:
+.PP
+.nf
+.RS
+melos status
+.RE
+.fi
+.PP
+Stop playback and the daemon:
+.PP
+.nf
+.RS
+melos stop
+.RE
+.fi
+.SH SEE ALSO
+.BR melosd (1),
+.BR mpv (1),
+.BR yt\-dlp (1),
+.BR playerctl (1)
+.SH BUGS
+Report bugs at https://github.com/ZT-Things/melos/issues.
