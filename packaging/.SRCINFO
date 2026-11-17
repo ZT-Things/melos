@@ -1,6 +1,6 @@
 pkgbase = melos
 	pkgdesc = Fast, minimal TUI music player with YouTube downloads
-	pkgver = 0.1.0
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/ZT-Things/melos
 	arch = x86_64
@@ -17,7 +17,7 @@ pkgbase = melos
 	provides = melos
 	conflicts = melos-bin
 	conflicts = melos-git
-	source = melos-0.1.0.tar.gz::https://github.com/ZT-Things/melos/releases/download/v0.1.0/melos-0.1.0.tar.gz
-	sha256sums = 81c8bfdc31e9decb2d308ca29ebcab57d087f54cbb3a23f56563db825b2585e1
+	source = melos-0.2.0.tar.gz::https://github.com/ZT-Things/melos/releases/download/v0.2.0/melos-0.2.0.tar.gz
+	sha256sums = 611c1f78a3847949d5eade037f70cd0feaee8f9d1222b4facbd34c7e30de8368
 
 pkgname = melos
