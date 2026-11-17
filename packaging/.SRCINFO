@@ -18,6 +18,6 @@ pkgbase = melos
 	conflicts = melos-bin
 	conflicts = melos-git
 	source = melos-0.2.0.tar.gz::https://github.com/ZT-Things/melos/releases/download/v0.2.0/melos-0.2.0.tar.gz
-	sha256sums = 611c1f78a3847949d5eade037f70cd0feaee8f9d1222b4facbd34c7e30de8368
+	sha256sums = ab7953a692a9b084183c29efa70c17b6c6ad63412579659bc327b782fb2f74a3
 
 pkgname = melos
