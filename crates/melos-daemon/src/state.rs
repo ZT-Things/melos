@@ -1,11 +1,11 @@
 //! Authoritative daemon state and the action reducer.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use melos_proto::{
     Action, DownloadRow, DownloadState, PlaylistRow, Repeat, ServerMsg, TrackRow, Transport,
     ViewModel, YtResultRow, config::Config, paths,
@@ -55,6 +55,7 @@ pub struct Daemon {
     last_persist: Instant,
     mpris: Option<Arc<Server<Mpris>>>,
     mpris_info: Option<Arc<Mutex<Info>>>,
+    listening: ListenTracker,
 }
 
 impl Daemon {
@@ -115,6 +116,35 @@ impl Daemon {
             last_persist: Instant::now(),
             mpris: None,
             mpris_info: None,
+            listening: ListenTracker::new(),
+        }
+    }
+
+    fn listen_tick(&mut self) {
+        let active = if self.player.playing && self.player.is_loaded() {
+            self.player
+                .current_id()
+                .and_then(|id| self.db.track(id).ok().flatten())
+                .map(|(row, _)| (row.id, row.title, row.artist))
+        } else {
+            None
+        };
+        if let Some(entry) = self.listening.advance(Instant::now(), active)
+            && let Err(e) =
+                self.db
+                    .add_listening(entry.track_id, &entry.title, &entry.artist, entry.ms)
+        {
+            tracing::warn!("could not record listening time: {e}");
+        }
+    }
+
+    fn flush_listening(&mut self) {
+        if let Some(entry) = self.listening.take()
+            && let Err(e) =
+                self.db
+                    .add_listening(entry.track_id, &entry.title, &entry.artist, entry.ms)
+        {
+            tracing::warn!("could not record listening time: {e}");
         }
     }
 
@@ -171,6 +201,7 @@ impl Daemon {
                 self.broadcast_state();
             }
             Internal::Tick => {
+                self.listen_tick();
                 self.sync_mpris();
                 if self.transport_dirty && !self.clients.is_empty() {
                     let transport = self.transport();
@@ -311,6 +342,73 @@ impl Daemon {
             Action::LibraryRefresh => {
                 self.refresh_library()?;
                 self.status = format!("{} tracks in library", self.tracks.len());
+            }
+            Action::DeleteTrack {
+                track_id,
+                delete_file,
+            } => {
+                let Some((row, path)) = self.db.track(track_id)? else {
+                    anyhow::bail!("track is no longer in the library");
+                };
+                if delete_file {
+                    let music = std::fs::canonicalize(self.cfg.music_dir_path())
+                        .context("music directory is not available")?;
+                    let target = std::fs::canonicalize(&path)
+                        .with_context(|| format!("audio file not found: {path}"))?;
+                    if !file_within(&music, &target) {
+                        anyhow::bail!("refusing to delete a file outside the music directory");
+                    }
+                    std::fs::remove_file(&target)
+                        .with_context(|| format!("could not delete {}", target.display()))?;
+                }
+                let was_current = self.player.current_id() == Some(track_id);
+                self.player.remove_track(track_id);
+                self.db.delete_track(track_id)?;
+                self.refresh_library()?;
+                self.refresh_playlists()?;
+                self.refresh_playlist_tracks()?;
+                self.status = if was_current {
+                    format!("removed {} and stopped playback", row.title)
+                } else if delete_file {
+                    format!("deleted {}", row.title)
+                } else {
+                    format!("removed {} from melos", row.title)
+                };
+            }
+            Action::RenameTrack { track_id, title } => {
+                let title = title.trim();
+                if title.is_empty() {
+                    anyhow::bail!("track name cannot be empty");
+                }
+                let Some((row, _)) = self.db.track(track_id)? else {
+                    anyhow::bail!("track is no longer in the library");
+                };
+                self.db.rename_track(track_id, title)?;
+                self.refresh_library()?;
+                self.refresh_playlist_tracks()?;
+                self.status = if self.player.current_id() == Some(track_id) {
+                    format!("renamed {} to {title}", row.title)
+                } else {
+                    format!("renamed to {title}")
+                };
+            }
+            Action::RenamePlaylist { playlist_id, name } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    anyhow::bail!("playlist name cannot be empty");
+                }
+                self.db.rename_playlist(playlist_id, name)?;
+                self.refresh_playlists()?;
+                self.status = format!("renamed playlist to {name}");
+            }
+            Action::RequestStats => {
+                self.listen_tick();
+                self.flush_listening();
+                let stats = self.db.stats()?;
+                self.status = format!(
+                    "{} tracked listening time",
+                    melos_proto::format_duration(stats.total_ms)
+                );
             }
             Action::CreatePlaylist { name } => {
                 let name = name.trim();
@@ -598,6 +696,7 @@ impl Daemon {
             .map(|(row, _)| row);
         Transport {
             track,
+            art_path: None,
             position_ms: self.player.position_ms,
             duration_ms: self.player.duration_ms,
             playing: self.player.playing,
@@ -625,6 +724,7 @@ impl Daemon {
             downloads: self.downloads.clone(),
             yt_results: self.yt_results.clone(),
             transport: self.transport(),
+            stats: self.db.stats().unwrap_or_default(),
             status: self.status.clone(),
         }
     }
@@ -708,6 +808,8 @@ impl Daemon {
     }
 
     pub async fn shutdown(&mut self) {
+        self.listen_tick();
+        self.flush_listening();
         self.player.stop();
         if let Some(mpv) = self.player.mpv_mut() {
             mpv.shutdown().await;
@@ -743,6 +845,10 @@ impl Default for Persisted {
     }
 }
 
+fn file_within(base: &Path, target: &Path) -> bool {
+    target.starts_with(base)
+}
+
 fn load_state() -> Option<Persisted> {
     let path = paths::state_file();
     let data = std::fs::read(path).ok()?;
@@ -758,4 +864,136 @@ fn save_state(state: &Persisted) -> Result<()> {
     std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ListenEntry {
+    track_id: i64,
+    title: String,
+    artist: String,
+    ms: u64,
+}
+
+/// Accumulates wall-clock listening time between ticks, so detached playback
+/// is counted as well.
+struct ListenTracker {
+    last: Instant,
+    entry: Option<ListenEntry>,
+}
+
+impl ListenTracker {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self {
+            last: now,
+            entry: None,
+        }
+    }
+
+    /// Advance the clock. Returns a completed entry when the active track
+    /// changes or playback stops.
+    fn advance(
+        &mut self,
+        now: Instant,
+        active: Option<(i64, String, String)>,
+    ) -> Option<ListenEntry> {
+        let elapsed = now.saturating_duration_since(self.last).as_millis() as u64;
+        self.last = now;
+        let same = match (&self.entry, &active) {
+            (Some(entry), Some((id, _, _))) => entry.track_id == *id,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            if let (Some(entry), Some((_, title, artist))) = (&mut self.entry, active) {
+                entry.ms = entry.ms.saturating_add(elapsed);
+                entry.title = title;
+                entry.artist = artist;
+            }
+            return None;
+        }
+        let old = self.entry.take();
+        self.entry = active.map(|(track_id, title, artist)| ListenEntry {
+            track_id,
+            title,
+            artist,
+            ms: 0,
+        });
+        old.filter(|entry| entry.ms > 0)
+    }
+
+    fn take(&mut self) -> Option<ListenEntry> {
+        self.entry.take().filter(|entry| entry.ms > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(id: i64) -> Option<(i64, String, String)> {
+        Some((id, format!("track {id}"), "Artist".into()))
+    }
+
+    #[test]
+    fn listening_time_accumulates_only_while_playing() {
+        let start = Instant::now();
+        let mut tracker = ListenTracker::new_at(start);
+        assert!(
+            tracker
+                .advance(start + Duration::from_secs(1), info(1))
+                .is_none()
+        );
+        assert!(
+            tracker
+                .advance(start + Duration::from_secs(3), info(1))
+                .is_none()
+        );
+        let flushed = tracker
+            .advance(start + Duration::from_secs(3), None)
+            .expect("pausing flushes the current track");
+        assert_eq!(flushed.track_id, 1);
+        assert_eq!(flushed.ms, 2_000);
+        assert!(
+            tracker
+                .advance(start + Duration::from_secs(9), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn switching_tracks_flushes_the_previous_track() {
+        let start = Instant::now();
+        let mut tracker = ListenTracker::new_at(start);
+        tracker.advance(start, info(1));
+        tracker.advance(start + Duration::from_secs(2), info(1));
+        let flushed = tracker
+            .advance(start + Duration::from_secs(2), info(2))
+            .expect("switching tracks flushes the old one");
+        assert_eq!(flushed.track_id, 1);
+        assert_eq!(flushed.ms, 2_000);
+        tracker.advance(start + Duration::from_secs(4), info(2));
+        let flushed = tracker.take().expect("shutdown flushes the last track");
+        assert_eq!(flushed.track_id, 2);
+        assert_eq!(flushed.ms, 2_000);
+    }
+
+    #[test]
+    fn delete_guard_only_accepts_files_under_the_music_dir() {
+        let base = std::env::temp_dir().join(format!("melos-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("music")).unwrap();
+        std::fs::write(base.join("music/a.opus"), b"x").unwrap();
+        std::fs::write(base.join("outside.opus"), b"x").unwrap();
+
+        let music = std::fs::canonicalize(base.join("music")).unwrap();
+        let inside = std::fs::canonicalize(base.join("music/a.opus")).unwrap();
+        let outside = std::fs::canonicalize(base.join("outside.opus")).unwrap();
+        assert!(file_within(&music, &inside));
+        assert!(!file_within(&music, &outside));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

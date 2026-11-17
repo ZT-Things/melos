@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "melos-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "melos-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "melos-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

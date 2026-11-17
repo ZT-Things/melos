@@ -298,6 +298,31 @@ impl Player {
         }
     }
 
+    /// Remove every occurrence of `id` from the queue. If it was playing,
+    /// playback stops; otherwise the current selection is preserved.
+    pub fn remove_track(&mut self, id: i64) {
+        let was_current = self.current_id() == Some(id);
+        let mut queue = Vec::with_capacity(self.queue.len());
+        let mut new_pos = None;
+        for (index, track) in self.queue.drain(..).enumerate() {
+            if track == id {
+                continue;
+            }
+            if self.pos == Some(index) {
+                new_pos = Some(queue.len());
+            }
+            queue.push(track);
+        }
+        self.queue = queue;
+        if was_current {
+            self.pos = None;
+            self.stop();
+        } else {
+            self.pos = new_pos;
+        }
+        self.rebuild_order();
+    }
+
     pub fn queue_add(&mut self, id: i64) {
         self.queue.push(id);
         self.rebuild_order();
@@ -421,5 +446,31 @@ mod tests {
         assert_eq!(player.file_ended("eof"), Some(false));
         assert!(!player.playing);
         assert!(!player.is_loaded());
+    }
+
+    #[test]
+    fn removing_a_track_before_the_current_one_keeps_the_current_selection() {
+        let mut player = Player::new(None, 70, false, Repeat::Off);
+        player.queue = vec![1, 2, 3];
+        player.pos = Some(2);
+        player.loaded = true;
+        player.playing = true;
+        player.remove_track(1);
+        assert_eq!(player.queue, vec![2, 3]);
+        assert_eq!(player.current_id(), Some(3));
+        assert!(player.playing);
+    }
+
+    #[test]
+    fn removing_the_current_track_stops_playback() {
+        let mut player = Player::new(None, 70, false, Repeat::Off);
+        player.queue = vec![1, 2, 3];
+        player.pos = Some(1);
+        player.loaded = true;
+        player.playing = true;
+        player.remove_track(2);
+        assert_eq!(player.queue, vec![1, 3]);
+        assert_eq!(player.pos, None);
+        assert!(!player.playing);
     }
 }

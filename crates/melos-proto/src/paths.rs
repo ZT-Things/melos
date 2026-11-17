@@ -31,6 +31,14 @@ pub fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("melos")
 }
 
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", ".cache").join("melos")
+}
+
+pub fn art_dir() -> PathBuf {
+    cache_dir().join("art")
+}
+
 pub fn db_path() -> PathBuf {
     data_dir().join("library.db")
 }

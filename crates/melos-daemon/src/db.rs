@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use melos_proto::{PlaylistRow, TrackRow};
+use melos_proto::{DayStat, NameStat, PlaylistRow, Stats, TrackRow, TrackStat};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub struct Db {
@@ -78,6 +78,16 @@ impl Db {
               key   TEXT PRIMARY KEY,
               value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS listening (
+              day       TEXT NOT NULL,
+              track_id  INTEGER NOT NULL,
+              title     TEXT NOT NULL,
+              artist    TEXT NOT NULL,
+              played_ms INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (day, track_id)
+            );
+            CREATE INDEX IF NOT EXISTS listening_day ON listening(day);
             "#,
         )?;
         Ok(())
@@ -259,6 +269,127 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub fn delete_track(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn rename_track(&self, id: i64, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        self.conn.execute(
+            "UPDATE listening SET title = ?2 WHERE track_id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE playlists SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Add listening time to the current local day.
+    pub fn add_listening(&self, track_id: i64, title: &str, artist: &str, ms: u64) -> Result<()> {
+        if ms == 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO listening (day, track_id, title, artist, played_ms)
+             VALUES (date('now','localtime'), ?1, ?2, ?3, ?4)
+             ON CONFLICT(day, track_id) DO UPDATE SET
+               played_ms = listening.played_ms + excluded.played_ms,
+               title = excluded.title,
+               artist = excluded.artist",
+            params![track_id, title, artist, ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn stats(&self) -> Result<Stats> {
+        let total_ms = sum_ms(
+            &self.conn,
+            "SELECT COALESCE(SUM(played_ms), 0) FROM listening",
+        )?;
+        let today_ms = sum_ms(
+            &self.conn,
+            "SELECT COALESCE(SUM(played_ms), 0) FROM listening
+             WHERE day = date('now','localtime')",
+        )?;
+        let week_ms = sum_ms(
+            &self.conn,
+            "SELECT COALESCE(SUM(played_ms), 0) FROM listening
+             WHERE day >= date('now','localtime','-6 days')",
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE days(day) AS (
+               SELECT date('now','localtime','-6 days')
+               UNION ALL
+               SELECT date(day, '+1 day') FROM days
+               WHERE day < date('now','localtime')
+             )
+             SELECT days.day, COALESCE(SUM(listening.played_ms), 0)
+             FROM days LEFT JOIN listening ON listening.day = days.day
+             GROUP BY days.day ORDER BY days.day",
+        )?;
+        let days = stmt
+            .query_map([], |r| {
+                Ok(DayStat {
+                    day: r.get(0)?,
+                    ms: r.get::<_, i64>(1)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT artist, SUM(played_ms) AS total FROM listening
+             GROUP BY artist ORDER BY total DESC, artist COLLATE NOCASE LIMIT 5",
+        )?;
+        let top_artists = stmt
+            .query_map([], |r| {
+                Ok(NameStat {
+                    name: r.get(0)?,
+                    ms: r.get::<_, i64>(1)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT title, artist, SUM(played_ms) AS total FROM listening
+             GROUP BY title, artist ORDER BY total DESC, title COLLATE NOCASE LIMIT 5",
+        )?;
+        let top_tracks = stmt
+            .query_map([], |r| {
+                Ok(TrackStat {
+                    title: r.get(0)?,
+                    artist: r.get(1)?,
+                    ms: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(Stats {
+            total_ms,
+            today_ms,
+            week_ms,
+            days,
+            top_artists,
+            top_tracks,
+        })
+    }
+}
+
+fn sum_ms(conn: &Connection, sql: &str) -> Result<u64> {
+    let value: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+    Ok(value.max(0) as u64)
 }
 
 fn row_to_track(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
@@ -297,10 +428,16 @@ mod tests {
                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
                created_at INTEGER NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE playlist_tracks (
-               playlist_id INTEGER NOT NULL, track_id INTEGER NOT NULL,
+               playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+               track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                position INTEGER NOT NULL, PRIMARY KEY (playlist_id, position),
                UNIQUE (playlist_id, track_id));
-             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE listening (
+               day TEXT NOT NULL, track_id INTEGER NOT NULL,
+               title TEXT NOT NULL, artist TEXT NOT NULL,
+               played_ms INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (day, track_id));",
         )
         .unwrap();
         Db { conn }
@@ -345,5 +482,53 @@ mod tests {
         assert_eq!(db.playlists().unwrap()[0].count, 1);
         db.delete_playlist(pl).unwrap();
         assert!(db.playlists().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_track_removes_membership_but_keeps_listening_history() {
+        let db = mem_db();
+        let id = db.insert(&track("a")).unwrap();
+        let pl = db.create_playlist("Favorites").unwrap();
+        db.add_to_playlist(pl, id).unwrap();
+        db.add_listening(id, "a", "Artist", 12_000).unwrap();
+        db.delete_track(id).unwrap();
+        assert!(db.track(id).unwrap().is_none());
+        assert!(db.playlist_tracks(pl).unwrap().is_empty());
+        assert_eq!(db.stats().unwrap().total_ms, 12_000);
+    }
+
+    #[test]
+    fn rename_track_updates_library_and_history() {
+        let db = mem_db();
+        let id = db.insert(&track("a")).unwrap();
+        db.add_listening(id, "a", "Artist", 5_000).unwrap();
+        db.rename_track(id, "Renamed").unwrap();
+        assert_eq!(db.track(id).unwrap().unwrap().0.title, "Renamed");
+        assert_eq!(db.stats().unwrap().top_tracks[0].title, "Renamed");
+    }
+
+    #[test]
+    fn rename_playlist_changes_the_visible_name() {
+        let db = mem_db();
+        let pl = db.create_playlist("Old").unwrap();
+        db.rename_playlist(pl, "New").unwrap();
+        assert_eq!(db.playlists().unwrap()[0].name, "New");
+    }
+
+    #[test]
+    fn listening_accumulates_per_day_and_builds_stats() {
+        let db = mem_db();
+        let id = db.insert(&track("a")).unwrap();
+        db.add_listening(id, "a", "Artist", 30_000).unwrap();
+        db.add_listening(id, "a", "Artist", 15_000).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.total_ms, 45_000);
+        assert_eq!(stats.today_ms, 45_000);
+        assert_eq!(stats.week_ms, 45_000);
+        assert_eq!(stats.days.len(), 7);
+        assert_eq!(stats.days.last().unwrap().ms, 45_000);
+        assert_eq!(stats.top_artists[0].name, "Artist");
+        assert_eq!(stats.top_artists[0].ms, 45_000);
+        assert_eq!(stats.top_tracks[0].title, "a");
     }
 }

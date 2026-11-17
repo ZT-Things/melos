@@ -9,7 +9,7 @@ pub mod paths;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Bump on every breaking change to the wire format.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Transport / UI model
@@ -68,6 +68,9 @@ pub struct PlaylistRow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transport {
     pub track: Option<TrackRow>,
+    /// Absolute path to cached cover art, if the daemon extracted one.
+    #[serde(default)]
+    pub art_path: Option<String>,
     pub position_ms: u64,
     pub duration_ms: u64,
     pub playing: bool,
@@ -75,6 +78,36 @@ pub struct Transport {
     pub muted: bool,
     pub shuffle: bool,
     pub repeat: Repeat,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Stats {
+    pub total_ms: u64,
+    pub today_ms: u64,
+    pub week_ms: u64,
+    /// Seven days, oldest first.
+    pub days: Vec<DayStat>,
+    pub top_artists: Vec<NameStat>,
+    pub top_tracks: Vec<TrackStat>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DayStat {
+    pub day: String,
+    pub ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NameStat {
+    pub name: String,
+    pub ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrackStat {
+    pub title: String,
+    pub artist: String,
+    pub ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +182,8 @@ pub struct ViewModel {
     pub downloads: Vec<DownloadRow>,
     pub yt_results: Vec<YtResultRow>,
     pub transport: Transport,
+    #[serde(default)]
+    pub stats: Stats,
     pub status: String,
 }
 
@@ -166,6 +201,7 @@ impl Default for ViewModel {
             downloads: Vec::new(),
             yt_results: Vec::new(),
             transport: Transport::default(),
+            stats: Stats::default(),
             status: String::new(),
         }
     }
@@ -224,6 +260,20 @@ pub enum Action {
     QueueClear,
 
     LibraryRefresh,
+    DeleteTrack {
+        track_id: i64,
+        #[serde(default)]
+        delete_file: bool,
+    },
+    RenameTrack {
+        track_id: i64,
+        title: String,
+    },
+    RenamePlaylist {
+        playlist_id: i64,
+        name: String,
+    },
+    RequestStats,
     CreatePlaylist {
         name: String,
     },
@@ -357,12 +407,73 @@ mod tests {
                 title: None,
                 uploader: None,
             },
+            Action::DeleteTrack {
+                track_id: 4,
+                delete_file: true,
+            },
+            Action::RenameTrack {
+                track_id: 4,
+                title: "New title".into(),
+            },
+            Action::RenamePlaylist {
+                playlist_id: 2,
+                name: "Focus".into(),
+            },
+            Action::RequestStats,
         ];
         for a in acts {
             let s = serde_json::to_string(&a).unwrap();
             let back: Action = serde_json::from_str(&s).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), s);
         }
+    }
+
+    #[test]
+    fn stats_and_art_default_to_empty_on_older_messages() {
+        let transport: Transport = serde_json::from_str(
+            r#"{"track":null,"position_ms":0,"duration_ms":0,"playing":false,
+                "volume":70,"muted":false,"shuffle":false,"repeat":"off"}"#,
+        )
+        .unwrap();
+        assert_eq!(transport.art_path, None);
+        let vm: ViewModel = serde_json::from_str(
+            r#"{"daemon_version":"0.1.0","protocol":1,"tracks":[],"queue":[],"queue_pos":null,
+                "playlists":[],"playlist_tracks":[],"selected_playlist":null,"downloads":[],
+                "yt_results":[],"transport":{"track":null,"position_ms":0,"duration_ms":0,
+                "playing":false,"volume":70,"muted":false,"shuffle":false,"repeat":"off"},
+                "status":""}"#,
+        )
+        .unwrap();
+        assert_eq!(vm.stats.total_ms, 0);
+        assert!(vm.stats.days.is_empty());
+    }
+
+    #[test]
+    fn stats_serialize_day_and_top_lists() {
+        let stats = Stats {
+            total_ms: 90_000,
+            today_ms: 30_000,
+            week_ms: 60_000,
+            days: vec![DayStat {
+                day: "2026-11-17".into(),
+                ms: 30_000,
+            }],
+            top_artists: vec![NameStat {
+                name: "Lamp".into(),
+                ms: 30_000,
+            }],
+            top_tracks: vec![TrackStat {
+                title: "Song".into(),
+                artist: "Lamp".into(),
+                ms: 30_000,
+            }],
+        };
+        let s = serde_json::to_string(&stats).unwrap();
+        let back: Stats = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.total_ms, 90_000);
+        assert_eq!(back.days[0].day, "2026-11-17");
+        assert_eq!(back.top_artists[0].name, "Lamp");
+        assert_eq!(back.top_tracks[0].title, "Song");
     }
 
     #[test]
