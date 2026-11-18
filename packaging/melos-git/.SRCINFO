@@ -18,6 +18,7 @@ pkgbase = melos-git
 	provides = melos
 	conflicts = melos
 	conflicts = melos-bin
+	options = !lto
 	source = melos-git::git+https://github.com/ZT-Things/melos.git
 	sha256sums = SKIP
 

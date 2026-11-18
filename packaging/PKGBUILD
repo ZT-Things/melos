@@ -4,6 +4,7 @@ pkgver=0.3.0
 pkgrel=1
 pkgdesc="Fast, minimal TUI music player with YouTube downloads"
 arch=('x86_64' 'aarch64')
+options=('!lto')
 url="https://github.com/ZT-Things/melos"
 license=('MIT')
 depends=('gcc-libs' 'mpv' 'sqlite' 'yt-dlp')
@@ -12,10 +13,14 @@ optdepends=('ffmpeg: audio extraction and thumbnail embedding for yt-dlp')
 provides=('melos')
 conflicts=('melos-bin' 'melos-git')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-sha256sums=('ab7953a692a9b084183c29efa70c17b6c6ad63412579659bc327b782fb2f74a3')
+sha256sums=('SKIP')
 
 build() {
     cd "$pkgname-$pkgver"
+    # makepkg LTO flags break ring's prebuilt assembly objects; keep Rust LTO only.
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
     export CARGO_TARGET_DIR=target
     cargo build --release --locked --workspace
 }
