@@ -19,6 +19,6 @@ pkgbase = melos
 	conflicts = melos-git
 	options = !lto
 	source = melos-0.3.0.tar.gz::https://github.com/ZT-Things/melos/releases/download/v0.3.0/melos-0.3.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = d843be6b9b9240b6a26231fb8220f8ec7bb523c9c6fd7ebc57d8cc590e460ca4
 
 pkgname = melos
