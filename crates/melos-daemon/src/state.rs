@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use melos_proto::{
-    Action, DownloadRow, DownloadState, PlaylistRow, Repeat, ServerMsg, TrackRow, Transport,
-    ViewModel, YtResultRow, config::Config, paths,
+    Action, DownloadRow, DownloadState, LyricsView, PlaylistRow, Repeat, ServerMsg, TrackRow,
+    Transport, ViewModel, YtResultRow, config::Config, lyrics::has_timestamps,
+    lyrics::plain_from_lrc, paths,
 };
 use mpris_server::Server;
 use tokio::sync::{Semaphore, mpsc};
@@ -17,6 +18,7 @@ use tokio::task::JoinHandle;
 use crate::art;
 use crate::db::Db;
 use crate::download;
+use crate::lyrics;
 use crate::mpris::{self, Info, Mpris, TrackInfo};
 use crate::mpv::MpvEvent;
 use crate::player::Player;
@@ -27,7 +29,14 @@ pub enum Internal {
     Download(download::Event),
     Client(mpsc::UnboundedSender<ServerMsg>),
     Mpris(Arc<Server<Mpris>>, Arc<Mutex<Info>>),
-    Artwork { track_id: i64, path: Option<String> },
+    Artwork {
+        track_id: i64,
+        path: Option<String>,
+    },
+    Lyrics {
+        track_id: i64,
+        result: Result<lyrics::FetchedLyrics, String>,
+    },
     Note(String),
     Tick,
 }
@@ -47,6 +56,7 @@ pub struct Daemon {
     selected_playlist: Option<i64>,
     downloads: Vec<DownloadRow>,
     jobs: HashMap<u64, JoinHandle<()>>,
+    download_urls: HashMap<u64, String>,
     next_job: u64,
     yt_results: Vec<YtResultRow>,
     clients: Vec<mpsc::UnboundedSender<ServerMsg>>,
@@ -61,6 +71,10 @@ pub struct Daemon {
     last_listen_flush: Instant,
     art_path: Option<String>,
     art_track: Option<i64>,
+    lyrics: Option<LyricsView>,
+    lyrics_track: Option<i64>,
+    lyrics_loading: bool,
+    lyrics_error: Option<String>,
 }
 
 impl Daemon {
@@ -111,6 +125,7 @@ impl Daemon {
             selected_playlist,
             downloads: Vec::new(),
             jobs: HashMap::new(),
+            download_urls: HashMap::new(),
             next_job: 1,
             yt_results: Vec::new(),
             clients: Vec::new(),
@@ -125,6 +140,10 @@ impl Daemon {
             last_listen_flush: Instant::now(),
             art_path: None,
             art_track: None,
+            lyrics: None,
+            lyrics_track: None,
+            lyrics_loading: false,
+            lyrics_error: None,
         }
     }
 
@@ -209,6 +228,34 @@ impl Daemon {
                     self.art_path = path;
                     self.art_track = Some(track_id);
                     self.transport_dirty = true;
+                }
+            }
+            Internal::Lyrics { track_id, result } => {
+                if self.player.current_id() == Some(track_id) {
+                    self.lyrics_loading = false;
+                    match result {
+                        Ok(fetched) => {
+                            self.lyrics = self
+                                .db
+                                .save_lyrics(
+                                    track_id,
+                                    &fetched.plain,
+                                    fetched.synced.as_deref(),
+                                    &fetched.source,
+                                )
+                                .ok();
+                            self.lyrics_error = None;
+                        }
+                        Err(error) => {
+                            // Keep any lyrics we already have (for example a
+                            // manual paste) when a refetch misses.
+                            self.status = error.clone();
+                            self.lyrics_error = Some(error);
+                        }
+                    }
+                    self.lyrics_track = Some(track_id);
+                    self.push_lyrics();
+                    self.broadcast_state();
                 }
             }
             Internal::Note(note) => {
@@ -363,6 +410,36 @@ impl Daemon {
                 self.player.queue_clear();
                 self.status = "queue cleared".into();
             }
+            Action::MoveQueue { start, len, delta } => {
+                if !self.player.move_queue(start, len, delta) {
+                    anyhow::bail!("the selected queue block cannot move further");
+                }
+                self.status = "queue reordered".into();
+            }
+            Action::MoveLibrary { start, len, delta } => {
+                if !self.db.move_library(start, len, delta)? {
+                    anyhow::bail!("the selected library block cannot move further");
+                }
+                self.refresh_library()?;
+                self.status = "library reordered".into();
+            }
+            Action::MovePlaylistTracks {
+                playlist_id,
+                start,
+                len,
+                delta,
+            } => {
+                if !self
+                    .db
+                    .move_playlist_tracks(playlist_id, start, len, delta)?
+                {
+                    anyhow::bail!("the selected playlist block cannot move further");
+                }
+                if self.selected_playlist == Some(playlist_id) {
+                    self.refresh_playlist_tracks()?;
+                }
+                self.status = "playlist reordered".into();
+            }
             Action::LibraryRefresh => {
                 self.refresh_library()?;
                 self.status = format!("{} tracks in library", self.tracks.len());
@@ -507,6 +584,16 @@ impl Daemon {
                 title,
                 uploader,
             } => {
+                if let Some(existing) = self.active_download(&url) {
+                    let name = self
+                        .downloads
+                        .iter()
+                        .find(|row| row.id == existing)
+                        .map(|row| row.title.clone())
+                        .unwrap_or_else(|| url.clone());
+                    self.status = format!("already downloading {name}");
+                    return Ok(());
+                }
                 let id = self.next_job;
                 self.next_job += 1;
                 let row = DownloadRow {
@@ -521,15 +608,18 @@ impl Daemon {
                 let cfg = self.cfg.clone();
                 let sem = self.sem.clone();
                 let tx = self.download_sender();
+                let dedupe_url = url.clone();
                 let handle =
                     tokio::spawn(download::download(id, url, title, uploader, cfg, sem, tx));
                 self.jobs.insert(id, handle);
+                self.download_urls.insert(id, dedupe_url);
                 self.status = "download queued".into();
             }
             Action::CancelDownload { id } => {
                 if let Some(handle) = self.jobs.remove(&id) {
                     handle.abort();
                 }
+                self.download_urls.remove(&id);
                 if let Some(row) = self.downloads.iter_mut().find(|r| r.id == id) {
                     row.state = DownloadState::Cancelled;
                     row.detail = "cancelled".into();
@@ -540,9 +630,98 @@ impl Daemon {
                 self.downloads.retain(|r| !r.state.is_finished());
                 self.status = "cleared finished downloads".into();
             }
+            Action::RequestLyrics { force } => {
+                let track_id = self
+                    .player
+                    .current_id()
+                    .ok_or_else(|| anyhow::anyhow!("nothing is playing"))?;
+                if !force && let Ok(Some(cached)) = self.db.get_lyrics(track_id) {
+                    self.lyrics = Some(cached);
+                    self.lyrics_track = Some(track_id);
+                    self.lyrics_loading = false;
+                    self.lyrics_error = None;
+                    self.push_lyrics();
+                    return Ok(());
+                }
+                let (track, _) = self
+                    .db
+                    .track(track_id)?
+                    .ok_or_else(|| anyhow::anyhow!("track not found"))?;
+                self.lyrics_track = Some(track_id);
+                self.lyrics_loading = true;
+                self.lyrics_error = None;
+                self.push_lyrics();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || lyrics::fetch(&track))
+                        .await
+                        .unwrap_or_else(|error| Err(format!("lyrics lookup failed: {error}")));
+                    let _ = tx.send(Internal::Lyrics { track_id, result });
+                });
+            }
+            Action::SaveLyrics { track_id, text } => {
+                let text = text.trim();
+                if text.is_empty() {
+                    anyhow::bail!("lyrics are empty");
+                }
+                let synced = has_timestamps(text);
+                let plain = if synced {
+                    plain_from_lrc(text)
+                } else {
+                    text.to_string()
+                };
+                let saved =
+                    self.db
+                        .save_lyrics(track_id, &plain, synced.then_some(text), "manual")?;
+                if self.player.current_id() == Some(track_id) {
+                    self.lyrics = Some(saved);
+                    self.lyrics_track = Some(track_id);
+                    self.lyrics_loading = false;
+                    self.lyrics_error = None;
+                    self.push_lyrics();
+                }
+                self.status = "lyrics saved".into();
+            }
+            Action::SetLyricsOffset {
+                track_id,
+                offset_ms,
+            } => {
+                let offset = offset_ms.clamp(-60_000, 60_000);
+                self.db.set_lyrics_offset(track_id, offset)?;
+                if self.player.current_id() == Some(track_id) {
+                    if let Some(lyrics) = self.lyrics.as_mut() {
+                        lyrics.offset_ms = offset;
+                    }
+                    self.push_lyrics();
+                }
+                self.status = format!("lyrics offset {:+} ms", offset);
+            }
             Action::Shutdown => {}
         }
         Ok(())
+    }
+
+    fn load_cached_lyrics(&mut self, track_id: Option<i64>) {
+        self.lyrics = None;
+        self.lyrics_track = track_id;
+        self.lyrics_loading = false;
+        self.lyrics_error = None;
+        if let Some(id) = track_id {
+            self.lyrics = self.db.get_lyrics(id).ok().flatten();
+        }
+    }
+
+    fn push_lyrics(&mut self) {
+        let track_id = self
+            .lyrics_track
+            .or_else(|| self.player.current_id())
+            .unwrap_or(0);
+        self.send_all(ServerMsg::Lyrics {
+            track_id,
+            lyrics: self.lyrics.clone(),
+            loading: self.lyrics_loading,
+            error: self.lyrics_error.clone(),
+        });
     }
 
     fn request_artwork(&mut self, track_id: i64, path: String) {
@@ -569,11 +748,11 @@ impl Daemon {
         match event {
             MpvEvent::FileLoaded => {
                 self.player.set_loaded(true);
-                let artwork = self
-                    .player
-                    .current_id()
-                    .and_then(|id| self.db.track(id).ok().flatten().map(|(_, path)| (id, path)));
-                if let Some((track_id, path)) = artwork {
+                let track_id = self.player.current_id();
+                self.load_cached_lyrics(track_id);
+                if let Some(track_id) = track_id
+                    && let Some((_, path)) = self.db.track(track_id).ok().flatten()
+                {
                     self.request_artwork(track_id, path);
                 }
             }
@@ -650,6 +829,7 @@ impl Daemon {
                             error: None,
                         });
                         self.jobs.remove(&id);
+                        self.download_urls.remove(&id);
                     }
                     Err(e) => {
                         self.status = format!("could not index download: {e}");
@@ -661,6 +841,8 @@ impl Daemon {
                             detail: "indexing failed".into(),
                             error: Some(e.to_string()),
                         });
+                        self.jobs.remove(&id);
+                        self.download_urls.remove(&id);
                     }
                 }
             }
@@ -672,6 +854,7 @@ impl Daemon {
                 }
                 self.status = format!("download failed: {error}");
                 self.jobs.remove(&id);
+                self.download_urls.remove(&id);
             }
         }
     }
@@ -682,6 +865,12 @@ impl Daemon {
         } else {
             self.downloads.insert(0, row);
         }
+    }
+
+    fn active_download(&self, url: &str) -> Option<u64> {
+        self.download_urls
+            .iter()
+            .find_map(|(id, queued)| (queued == url).then_some(*id))
     }
 
     /// Bridge a downloader's event channel into the daemon's actor channel.
@@ -781,6 +970,9 @@ impl Daemon {
             yt_results: self.yt_results.clone(),
             transport: self.transport(),
             stats: self.db.stats().unwrap_or_default(),
+            lyrics: self.lyrics.clone(),
+            lyrics_loading: self.lyrics_loading,
+            lyrics_error: self.lyrics_error.clone(),
             status: self.status.clone(),
         }
     }
@@ -1096,6 +1288,7 @@ mod tests {
             selected_playlist: None,
             downloads: Vec::new(),
             jobs: HashMap::new(),
+            download_urls: HashMap::new(),
             next_job: 1,
             yt_results: Vec::new(),
             clients: Vec::new(),
@@ -1110,6 +1303,10 @@ mod tests {
             last_listen_flush: Instant::now(),
             art_path: None,
             art_track: None,
+            lyrics: None,
+            lyrics_track: None,
+            lyrics_loading: false,
+            lyrics_error: None,
         };
         (daemon, base)
     }
@@ -1133,6 +1330,100 @@ mod tests {
     }
 
     #[test]
+    fn reorder_actions_update_the_visible_library_playlist_and_queue() {
+        let (mut daemon, base) = test_daemon("reorder");
+        let (b, _) = insert_file(&daemon, "b");
+        let (a, _) = insert_file(&daemon, "a");
+        daemon.refresh_library().unwrap();
+        assert_eq!(
+            daemon
+                .tracks
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+
+        daemon
+            .apply(Action::MoveLibrary {
+                start: 1,
+                len: 1,
+                delta: -1,
+            })
+            .unwrap();
+        assert_eq!(
+            daemon
+                .tracks
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        let playlist = daemon.db.create_playlist("Mix").unwrap();
+        daemon.db.add_to_playlist(playlist, b).unwrap();
+        daemon.db.add_to_playlist(playlist, a).unwrap();
+        daemon.selected_playlist = Some(playlist);
+        daemon.refresh_playlist_tracks().unwrap();
+        daemon
+            .apply(Action::MovePlaylistTracks {
+                playlist_id: playlist,
+                start: 0,
+                len: 1,
+                delta: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            daemon
+                .playlist_tracks
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        daemon.player.queue = vec![a, b];
+        daemon
+            .apply(Action::MoveQueue {
+                start: 0,
+                len: 1,
+                delta: 1,
+            })
+            .unwrap();
+        assert_eq!(daemon.player.queue, vec![b, a]);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn failed_refetch_keeps_existing_lyrics() {
+        let (mut daemon, base) = test_daemon("lyrics-preserve");
+        let (id, _) = insert_file(&daemon, "song");
+        daemon.player.play_track(id, &[id], &daemon.db).unwrap();
+        let saved = daemon
+            .db
+            .save_lyrics(id, "line one", None, "manual")
+            .unwrap();
+        daemon.lyrics = Some(saved);
+        daemon.lyrics_track = Some(id);
+
+        daemon
+            .handle(Internal::Lyrics {
+                track_id: id,
+                result: Err("no lyrics found on LRCLIB".into()),
+            })
+            .await;
+
+        assert!(daemon.lyrics.is_some());
+        assert_eq!(
+            daemon.lyrics_error.as_deref(),
+            Some("no lyrics found on LRCLIB")
+        );
+        assert_eq!(daemon.status, "no lyrics found on LRCLIB");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn delete_guard_only_accepts_files_under_the_music_dir() {
         let base = std::env::temp_dir().join(format!("melos-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -1146,6 +1437,27 @@ mod tests {
         assert!(file_within(&music, &inside));
         assert!(!file_within(&music, &outside));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn active_downloads_are_matched_by_url() {
+        let (mut daemon, _base) = test_daemon("active-download");
+        daemon
+            .download_urls
+            .insert(7, "https://www.youtube.com/watch?v=r1PPckDMMSg".to_string());
+        assert_eq!(
+            daemon.active_download("https://www.youtube.com/watch?v=r1PPckDMMSg"),
+            Some(7)
+        );
+        assert_eq!(
+            daemon.active_download("https://www.youtube.com/watch?v=other"),
+            None
+        );
+        daemon.download_urls.remove(&7);
+        assert_eq!(
+            daemon.active_download("https://www.youtube.com/watch?v=r1PPckDMMSg"),
+            None
+        );
     }
 
     #[test]

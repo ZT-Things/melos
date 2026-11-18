@@ -15,8 +15,8 @@ and bash/zsh/fish completions. The service is **not** enabled automatically.
 
 1. Create the public repository at <https://github.com/ZT-Things/melos> and push
    the source (see the release script below).
-2. Create the `v0.2.0` tag and a GitHub release with
-   `melos-0.2.0-x86_64-unknown-linux-gnu.tar.gz`.
+2. Create the `v0.3.0` tag and a GitHub release with
+   `melos-0.3.0-x86_64-unknown-linux-gnu.tar.gz`.
 3. Replace `sha256sums=('SKIP')` with real hashes:
    `cd packaging && updpkgsums`, then the same in `melos-bin/`.
 4. Check with `namcap PKGBUILD` and `makepkg -si` in a clean chroot.
@@ -44,7 +44,7 @@ point `source` at a local tarball.
 From the repository root:
 
 ```sh
-./scripts/release.sh 0.2.0
+./scripts/release.sh 0.3.0
 ```
 
 This creates `dist/` with the source tarball, the prebuilt x86_64 tarball, and

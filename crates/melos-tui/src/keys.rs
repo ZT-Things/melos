@@ -59,6 +59,7 @@ impl KeyMap {
             "pane_playlists",
             "pane_queue",
             "pane_downloads",
+            "pane_lyrics",
             "pane_stats",
             "confirm",
             "pause",
@@ -75,9 +76,18 @@ impl KeyMap {
             "repeat",
             "queue_add",
             "playlist_add",
+            "visual",
+            "move_down",
+            "move_up",
+            "new_playlist",
             "remove",
             "delete_track",
             "rename",
+            "lyrics_paste",
+            "lyrics_edit",
+            "lyrics_fetch",
+            "lyrics_offset_back",
+            "lyrics_offset_fwd",
             "filter",
             "download",
             "playlist_delete",
@@ -88,7 +98,18 @@ impl KeyMap {
         ];
         let mut rows = Vec::new();
         for action in ORDER {
-            let chords = self.chords(action);
+            let mut chords = self.chords(action);
+            let alias = match *action {
+                "lyrics_paste" => Some("p"),
+                "lyrics_edit" => Some("e"),
+                "lyrics_fetch" => Some("f"),
+                _ => None,
+            };
+            if let Some(alias) = alias
+                && !chords.iter().any(|chord| chord == alias)
+            {
+                chords.push(alias.to_string());
+            }
             if chords.is_empty() {
                 continue;
             }
@@ -195,6 +216,22 @@ mod tests {
     }
 
     #[test]
+    fn configurable_ctrl_j_and_k_are_distinct_from_enter() {
+        let mut cfg = BTreeMap::new();
+        cfg.insert("half_down".to_string(), vec!["ctrl+j".to_string()]);
+        cfg.insert("half_up".to_string(), vec!["ctrl+k".to_string()]);
+        let map = KeyMap::from_config(&cfg);
+        assert_eq!(
+            map.action(key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Some("half_down")
+        );
+        assert_eq!(
+            map.action(key(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            Some("half_up")
+        );
+    }
+
+    #[test]
     fn space_and_plus() {
         let map = KeyMap::from_config(&melos_proto::config::Config::default().keys);
         assert_eq!(
@@ -213,5 +250,31 @@ mod tests {
         assert_eq!(normalize("Q"), "Q");
         assert_eq!(normalize("shift+LEFT"), "shift+left");
         assert_eq!(normalize("+"), "+");
+    }
+
+    #[test]
+    fn help_lists_new_playlist() {
+        let map = KeyMap::from_config(&melos_proto::config::Config::default().keys);
+        assert!(
+            map.help_rows()
+                .contains(&("new_playlist".to_string(), "N".to_string()))
+        );
+    }
+
+    #[test]
+    fn help_shows_unshifted_lyrics_aliases() {
+        let map = KeyMap::from_config(&melos_proto::config::Config::default().keys);
+        let rows = map.help_rows();
+        for (action, chord) in [
+            ("lyrics_paste", "p"),
+            ("lyrics_edit", "e"),
+            ("lyrics_fetch", "f"),
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|(name, keys)| name == action && keys.split(", ").any(|k| k == chord)),
+                "{action} should list {chord}"
+            );
+        }
     }
 }

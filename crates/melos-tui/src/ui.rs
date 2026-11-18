@@ -1,14 +1,15 @@
 //! Rendering. Everything is derived from `App`; no daemon state lives here.
 
+use melos_proto::lyrics::{current_line, parse_lrc};
 use melos_proto::{DownloadState, Repeat, format_duration, truncate};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
 };
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::{FontSize, Resize, StatefulImage};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, DeleteChoice, Focus, InputKind, Overlay, View};
@@ -17,6 +18,7 @@ const ACCENT: Color = Color::Rgb(214, 168, 95);
 const NOW: Color = Color::Rgb(157, 191, 143);
 const DIM: Color = Color::Rgb(122, 116, 106);
 const SURFACE: Color = Color::Rgb(48, 44, 40);
+const VISUAL: Color = Color::Rgb(66, 57, 46);
 const DANGER: Color = Color::Rgb(207, 106, 94);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -30,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
     let [sidebar, main] =
-        Layout::horizontal([Constraint::Length(24), Constraint::Min(20)]).areas(body);
+        Layout::horizontal([Constraint::Length(28), Constraint::Min(20)]).areas(body);
 
     draw_sidebar(frame, app, sidebar);
     draw_main(frame, app, main);
@@ -47,7 +49,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
     if let Some(input) = &app.input {
-        draw_input(frame, app, &input.kind, &input.buffer, status);
+        match &input.kind {
+            InputKind::LyricsPaste(track_id) => {
+                draw_lyrics_paste(frame, app, *track_id, &input.buffer, area)
+            }
+            kind => draw_input(frame, app, kind, &input.buffer, status),
+        }
     }
 }
 
@@ -67,8 +74,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let art_width = inner.width.saturating_sub(2).max(1);
+    let font = app
+        .picker
+        .as_ref()
+        .map(|picker| picker.font_size())
+        .unwrap_or(FontSize::new(10, 20));
     let art_height = if inner.height >= 16 {
-        ((inner.width as f32 * 0.55) as u16).clamp(6, 11)
+        let max = inner.height.saturating_sub(5).clamp(4, 12);
+        art_height_for_aspect(app.art_aspect().unwrap_or(9.0 / 16.0), art_width, font, max)
     } else {
         0
     };
@@ -86,7 +100,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             ..art_area
         };
         frame.render_stateful_widget(
-            StatefulImage::new().resize(Resize::Crop(None)),
+            StatefulImage::new().resize(Resize::Fit(None)),
             image_area,
             art,
         );
@@ -152,7 +166,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, nav_area, &mut state);
 }
 
-fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut title = match app.view {
         View::PlaylistTracks => {
             let name = app
@@ -165,6 +179,9 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         }
         other => format!(" {} ", other.title()),
     };
+    if app.visual_anchor.is_some() {
+        title.push_str("VISUAL  ");
+    }
     if !app.filter.is_empty() {
         title.push_str(&format!("filter: {}  ", truncate(&app.filter, 30)));
     }
@@ -176,6 +193,10 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Reset)
                 .add_modifier(Modifier::BOLD),
         ));
+    if app.view == View::Lyrics {
+        draw_lyrics(frame, app, block, area);
+        return;
+    }
     if app.view == View::Stats {
         draw_stats(frame, app, block, area);
         return;
@@ -187,7 +208,7 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         View::Playlists => playlist_items(app, width),
         View::Queue => queue_items(app, width),
         View::Downloads => download_items(app, width),
-        View::Stats => Vec::new(),
+        View::Lyrics | View::Stats => Vec::new(),
     };
 
     if items.is_empty() {
@@ -201,6 +222,7 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
             }
             View::Queue => "The queue is empty. Press a on a track to add it.",
             View::Downloads => "Press i to search YouTube or paste a URL.",
+            View::Lyrics => "No lyrics yet.",
             View::Stats => "No listening time yet.",
         };
         let p = Paragraph::new(empty)
@@ -228,9 +250,11 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
 
 fn track_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
     let playing_id = app.vm.transport.track.as_ref().map(|t| t.id);
+    let visual = app.visual_range();
     app.visible_tracks()
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(index, t)| {
             let playing = playing_id == Some(t.id);
             let marker = if playing { "▶" } else { " " };
             let marker_style = if playing {
@@ -246,14 +270,20 @@ fn track_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
                 Style::default().add_modifier(Modifier::BOLD)
             };
             let title_width = width.saturating_sub(30).max(10);
-            ListItem::new(Line::from(vec![
+            let line = Line::from(vec![
                 Span::styled(format!("{marker} "), marker_style),
                 Span::styled(truncate(&t.title, title_width), title_style),
                 Span::raw("  "),
                 Span::styled(truncate(&t.artist, 24), Style::default().fg(DIM)),
                 Span::raw("  "),
                 Span::styled(t.duration_label(), Style::default().fg(DIM)),
-            ]))
+            ]);
+            let line = if visual.is_some_and(|(start, end)| index >= start && index <= end) {
+                line.style(Style::default().bg(VISUAL))
+            } else {
+                line
+            };
+            ListItem::new(line)
         })
         .collect()
 }
@@ -272,6 +302,7 @@ fn playlist_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
 }
 
 fn queue_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
+    let visual = app.visual_range();
     app.vm
         .queue
         .iter()
@@ -284,13 +315,19 @@ fn queue_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(vec![
+            let line = Line::from(vec![
                 Span::styled(format!("{marker} "), style),
                 Span::styled(format!("{:>3} ", i + 1), Style::default().fg(DIM)),
                 Span::styled(truncate(&t.title, width.saturating_sub(30)), style),
                 Span::raw("  "),
                 Span::styled(truncate(&t.artist, 20), Style::default().fg(DIM)),
-            ]))
+            ]);
+            let line = if visual.is_some_and(|(start, end)| i >= start && i <= end) {
+                line.style(Style::default().bg(VISUAL))
+            } else {
+                line
+            };
+            ListItem::new(line)
         })
         .collect()
 }
@@ -332,6 +369,159 @@ fn download_items(app: &App, width: usize) -> Vec<ListItem<'static>> {
         ])));
     }
     items
+}
+
+fn draw_lyrics(frame: &mut Frame, app: &mut App, block: Block<'_>, area: Rect) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    app.lyrics_page = body.height.max(1) as usize;
+
+    let Some(track) = app.vm.transport.track.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("Play a track to load its lyrics.").style(Style::default().fg(DIM)),
+            body,
+        );
+        return;
+    };
+
+    let source = if app.vm.lyrics_loading {
+        "LRCLIB · searching".to_string()
+    } else if let Some(lyrics) = &app.vm.lyrics {
+        let kind = if lyrics.synced.is_some() {
+            "synced"
+        } else {
+            "plain"
+        };
+        format!("{} · {kind}", lyrics.source)
+    } else if app.vm.lyrics_error.is_some() {
+        "no lyrics".to_string()
+    } else {
+        String::new()
+    };
+    let width = header.width as usize;
+    let title = format!("{} — {}", track.title, track.artist);
+    let title = fit(&title, width.saturating_sub(source.width() + 1));
+    let gap = width.saturating_sub(title.width() + source.width());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(source, Style::default().fg(DIM)),
+        ])),
+        Rect {
+            height: 1,
+            ..header
+        },
+    );
+
+    let offset = app.vm.lyrics.as_ref().map(|l| l.offset_ms).unwrap_or(0);
+    let synced = app
+        .vm
+        .lyrics
+        .as_ref()
+        .and_then(|lyrics| lyrics.synced.as_ref())
+        .is_some();
+    let mut footer_text = if synced {
+        "j/k select · Ctrl+d/u half page · PgUp/PgDn · Enter seek · p/e/f · [ ] offset".to_string()
+    } else {
+        "j/k scroll · Ctrl+d/u half page · PgUp/PgDn · p/e/f · [ ] offset".to_string()
+    };
+    if offset != 0 {
+        footer_text.push_str(&format!(" ({offset:+}ms)"));
+    }
+    frame.render_widget(
+        Paragraph::new(fit(&footer_text, footer.width as usize)).style(Style::default().fg(DIM)),
+        footer,
+    );
+
+    if app.vm.lyrics_loading {
+        frame.render_widget(
+            Paragraph::new("Searching LRCLIB for this track…").style(Style::default().fg(ACCENT)),
+            body,
+        );
+        return;
+    }
+
+    let Some(lyrics) = &app.vm.lyrics else {
+        let message = match &app.vm.lyrics_error {
+            Some(error) => format!(
+                "{error}\n\nPress P to paste lyrics, E to open $EDITOR, or F to search again."
+            ),
+            None => "No lyrics loaded yet.\n\nPress F to search LRCLIB, P to paste, or E to edit."
+                .to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(DIM))
+                .wrap(Wrap { trim: false }),
+            body,
+        );
+        return;
+    };
+
+    if let Some(synced) = &lyrics.synced {
+        let lines = parse_lrc(synced);
+        if !lines.is_empty() {
+            let height = body.height as usize;
+            let current = current_line(&lines, app.vm.transport.position_ms, lyrics.offset_ms);
+            let selected = app.lyrics_selection.filter(|index| *index < lines.len());
+            let focus = selected.or(current).unwrap_or(0);
+            let start = focus
+                .saturating_sub(height / 2)
+                .min(lines.len().saturating_sub(height.max(1)));
+            let mut rendered = Vec::new();
+            for (index, line) in lines.iter().enumerate().skip(start).take(height) {
+                let active = current == Some(index);
+                let chosen = selected == Some(index);
+                let time_style = if chosen || active {
+                    Style::default().fg(ACCENT)
+                } else {
+                    Style::default().fg(DIM)
+                };
+                let text_style = if chosen {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else if active {
+                    Style::default().fg(NOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Reset)
+                };
+                rendered.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>8}  ", format_duration(line.timestamp_ms)),
+                        time_style,
+                    ),
+                    Span::styled(line.text.clone(), text_style),
+                ]));
+            }
+            frame.render_widget(Paragraph::new(rendered), body);
+            return;
+        }
+    }
+
+    let scroll = app
+        .lyrics_scroll
+        .min(lyrics.plain.lines().count().saturating_sub(1)) as u16;
+    frame.render_widget(
+        Paragraph::new(lyrics.plain.clone())
+            .style(Style::default().fg(Color::Reset))
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        body,
+    );
 }
 
 fn draw_stats(frame: &mut Frame, app: &App, block: Block<'_>, area: Rect) {
@@ -497,6 +687,10 @@ fn human_time(ms: u64) -> String {
 }
 
 fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
+    let area = area.inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
     let [title_area, artist_area, gauge_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -568,6 +762,10 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let area = area.inner(Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
     let left = app.status_text();
     let modes = format!(
         "shuffle {}   repeat {}",
@@ -602,6 +800,7 @@ fn draw_input(frame: &mut Frame, app: &App, kind: &InputKind, buffer: &str, area
         InputKind::Download => ("search / url", "Enter search or download · Esc cancel"),
         InputKind::RenameTrack(_) => ("rename track", "Enter save · Esc cancel"),
         InputKind::RenamePlaylist(_) => ("rename playlist", "Enter save · Esc cancel"),
+        InputKind::LyricsPaste(_) => ("lyrics", "Ctrl+S save · Esc cancel"),
     };
     let text = format!(" {label}: {buffer}▏  {hint}");
     frame.render_widget(
@@ -610,6 +809,47 @@ fn draw_input(frame: &mut Frame, app: &App, kind: &InputKind, buffer: &str, area
         area,
     );
     let _ = app;
+}
+
+fn draw_lyrics_paste(frame: &mut Frame, app: &App, track_id: i64, buffer: &str, area: Rect) {
+    let width = area.width.saturating_sub(8).clamp(40, 100);
+    let height = area.height.saturating_sub(4).clamp(14, 34);
+    let popup = centered_abs(width, height, area);
+    frame.render_widget(Clear, popup);
+    let name = app
+        .vm
+        .transport
+        .track
+        .as_ref()
+        .filter(|track| track.id == track_id)
+        .map(|track| format!("{} — {}", track.title, track.artist))
+        .unwrap_or_else(|| "Paste lyrics".into());
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Paste lyrics · Ctrl+S save · Esc cancel ".to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [title_area, text_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(fit(&name, title_area.width as usize)).style(Style::default().fg(DIM)),
+        title_area,
+    );
+    let text = if buffer.is_empty() {
+        "Paste text or LRC here…".to_string()
+    } else {
+        buffer.to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(if buffer.is_empty() { DIM } else { Color::Reset }))
+            .wrap(Wrap { trim: false }),
+        text_area,
+    );
 }
 
 fn draw_delete(frame: &mut Frame, area: Rect, title: &str, choice: DeleteChoice) {
@@ -711,6 +951,19 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+fn art_height_for_aspect(aspect: f32, width: u16, font: FontSize, max: u16) -> u16 {
+    if width == 0 || font.height == 0 {
+        return 0;
+    }
+    let aspect = if aspect.is_finite() {
+        aspect.clamp(0.1, 4.0)
+    } else {
+        9.0 / 16.0
+    };
+    let rows = (width as f32 * aspect * (font.width as f32 / font.height as f32)).round() as u16;
+    rows.clamp(4, max.max(4))
+}
+
 fn fit(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
@@ -796,6 +1049,7 @@ fn friendly(action: &str) -> String {
         "pane_playlists" => "playlists pane",
         "pane_queue" => "queue pane",
         "pane_downloads" => "downloads pane",
+        "pane_lyrics" => "lyrics pane",
         "pane_stats" => "statistics pane",
         "confirm" => "play / open",
         "pause" => "play-pause",
@@ -812,10 +1066,18 @@ fn friendly(action: &str) -> String {
         "repeat" => "repeat mode",
         "queue_add" => "add to queue",
         "playlist_add" => "add to playlist",
+        "visual" => "visual select",
+        "move_down" => "move block down",
+        "move_up" => "move block up",
         "new_playlist" => "new playlist",
         "remove" => "remove / cancel",
         "delete_track" => "delete track",
         "rename" => "rename",
+        "lyrics_paste" => "paste lyrics",
+        "lyrics_edit" => "edit lyrics",
+        "lyrics_fetch" => "fetch lyrics",
+        "lyrics_offset_back" => "lyrics -0.5s",
+        "lyrics_offset_fwd" => "lyrics +0.5s",
         "filter" => "filter",
         "download" => "download / search",
         "playlist_delete" => "delete playlist",
@@ -826,4 +1088,140 @@ fn friendly(action: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::KeyMap;
+    use melos_proto::{TrackRow, ViewModel};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn artwork_height_follows_the_image_aspect() {
+        let font = FontSize::new(10, 20);
+        assert_eq!(art_height_for_aspect(9.0 / 16.0, 24, font, 12), 7);
+        assert_eq!(art_height_for_aspect(1.0, 24, font, 12), 12);
+        assert_eq!(art_height_for_aspect(1.0, 24, font, 6), 6);
+        assert_eq!(art_height_for_aspect(9.0 / 16.0, 0, font, 12), 0);
+        assert_eq!(art_height_for_aspect(f32::NAN, 24, font, 12), 7);
+    }
+
+    #[test]
+    fn lyrics_view_renders_synced_lines_in_place() {
+        let vm = ViewModel {
+            status: "ready".into(),
+            transport: melos_proto::Transport {
+                track: Some(TrackRow {
+                    id: 1,
+                    title: "Song".into(),
+                    artist: "Artist".into(),
+                    album: None,
+                    duration_ms: 180_000,
+                    missing: false,
+                }),
+                position_ms: 6_000,
+                duration_ms: 180_000,
+                playing: true,
+                ..Default::default()
+            },
+            lyrics: Some(melos_proto::LyricsView {
+                track_id: 1,
+                plain: "first line\nsecond line".into(),
+                synced: Some("[00:05.00]first line\n[00:10.00]second line".into()),
+                source: "manual".into(),
+                offset_ms: 0,
+                updated_at: 0,
+            }),
+            ..Default::default()
+        };
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+        app.view = View::Lyrics;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        assert!(app.lyrics_page > 0);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("first line"));
+        assert!(text.contains("second line"));
+        assert!(text.contains("manual"));
+    }
+
+    #[test]
+    fn visual_selection_is_highlighted_and_marked_in_the_title() {
+        let vm = ViewModel {
+            tracks: vec![
+                TrackRow {
+                    id: 1,
+                    title: "One".into(),
+                    artist: "Artist".into(),
+                    album: None,
+                    duration_ms: 60_000,
+                    missing: false,
+                },
+                TrackRow {
+                    id: 2,
+                    title: "Two".into(),
+                    artist: "Artist".into(),
+                    album: None,
+                    duration_ms: 60_000,
+                    missing: false,
+                },
+            ],
+            status: "ready".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+        app.main_idx = 1;
+        app.visual_anchor = Some(0);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("VISUAL"));
+        assert!(buffer.content().iter().any(|cell| cell.bg == VISUAL));
+    }
+
+    #[test]
+    fn bottom_lines_are_padded_away_from_the_edge() {
+        let vm = ViewModel {
+            status: "ready".into(),
+            transport: melos_proto::Transport {
+                track: Some(TrackRow {
+                    id: 1,
+                    title: "Song".into(),
+                    artist: "Artist".into(),
+                    album: None,
+                    duration_ms: 180_000,
+                    missing: false,
+                }),
+                duration_ms: 180_000,
+                playing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, 19)].symbol(), "▶");
+        assert_eq!(buffer[(2, 23)].symbol(), "r");
+    }
 }

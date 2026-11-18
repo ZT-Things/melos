@@ -8,7 +8,7 @@ downloads, playback and MPRIS, so opening the interface is instant and music
 keeps playing after you close it.
 
 ```
-┌ melos v0.2.0 ────────┬ Library ──────────────────────────────────────────┐
+┌ melos v0.3.0 ────────┬ Library ──────────────────────────────────────────┐
 │ ▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄ │   A Short Walk With You       Purrple Cat   1:32  │
 │ ▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀ │ ▶ Night Drive                 Nils          4:10  │
 │ A Short Walk With... │   Rain on Glass               ...           3:58  │
@@ -17,7 +17,8 @@ keeps playing after you close it.
 │  Playlists       3   ├───────────────────────────────────────────────────┤
 │  Queue           2   │ ▶ Night Drive — Nils                              │
 │  Downloads           │ ████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-│  Statistics          │ j/k move  Space pause  n/p track  q detach         │
+│  Lyrics              │ j/k move  Space pause  n/p track  q detach         │
+│  Statistics          │                                                   │
 └──────────────────────┴───────────────────────────────────────────────────┘
 ```
 
@@ -31,8 +32,12 @@ keeps playing after you close it.
   run concurrently in the background while you keep browsing.
 - **Playlists** — create, rename, add tracks, remove tracks, and play from any
   row. Rename tracks too; your display names never rewrite the audio tags.
-- **Album art** — embedded thumbnails appear in the sidebar, with a clean
-  placeholder when a track has none.
+- **Album art** — embedded thumbnails appear in the sidebar, sized to the
+  image's aspect ratio so the whole cover fits. Native Kitty graphics are used
+  in Kitty (including inside tmux); other terminals get a colored half-block
+  rendering, and a clean placeholder appears when a track has none.
+- **Lyrics** — LRCLIB lookup with synced line highlighting, plus manual paste
+  or `$EDITOR` for tracks LRCLIB does not know. Cached offline.
 - **Listening statistics** — all-time, today, last seven days, plus top artists
   and tracks. Time is counted while the daemon plays, even with the UI closed.
 - **Deletion with a choice** — remove a track from melos only, or delete the
@@ -106,6 +111,29 @@ Enter, or paste a YouTube URL and press Enter.
 - `e`/`F2` on a track in the Library or a playlist renames its display name.
 - `Enter` in the Library or a playlist starts that track with the whole visible
   list as context, so `n`/`p` move through it.
+- The Library uses a manual order. `V` starts visual selection, `j`/`k` extend
+  it, and `Shift+J`/`Shift+K` move the selected block. The same works in a
+  playlist and the queue; `Esc` or `V` exits. New downloads append to the end.
+
+### Lyrics
+
+Press `5` for the Lyrics pane. Tracks are looked up on
+[LRCLIB](https://lrclib.net) when you open the pane or change track. Synced
+lyrics follow playback and the current line is highlighted; `Enter` seeks to
+that line.
+
+- `p` pastes lyrics manually. LRC timestamps are detected automatically; plain
+  text is saved as unsynced lyrics. Use `Ctrl+S` to save. `P` works too.
+- `e` opens the current lyrics in `$EDITOR` for corrections. `E` works too.
+- `f` retries the LRCLIB lookup. `F` works too.
+- `[` / `]` shift the sync offset by half a second.
+- In synced lyrics, `j` / `k` select the next or previous line,
+  `Ctrl+d` / `Ctrl+u` move by half a page, and `PgDn` / `PgUp` move by a full
+  page. `Enter` seeks to the selected line; `Esc` returns to following
+  playback. Plain lyrics scroll with the same keys.
+
+Lyrics are cached in the library database, so they keep working offline. There
+is no Genius or other page scraping; paste text you have the right to use.
 
 ### Removing tracks
 
@@ -121,7 +149,7 @@ the configured music directory.
 
 ### Listening statistics
 
-Press `5` for the Statistics pane: all-time time, today, the last seven days,
+Press `6` for the Statistics pane: all-time time, today, the last seven days,
 and the artists and tracks you have played most. Time is counted while `melosd`
 is playing, including when the TUI is detached. Only playback through melos is
 counted.
@@ -135,8 +163,8 @@ counted.
 | `Ctrl+d` `Ctrl+u` | half page down / up |
 | `PgDn` `PgUp` | page down / up |
 | `Tab` | switch between sidebar and main pane |
-| `1` `2` `3` `4` `5` | Library, Playlists, Queue, Downloads, Statistics |
-| `Enter` | play / open / confirm |
+| `1` `2` `3` `4` `5` `6` | Library, Playlists, Queue, Downloads, Lyrics, Statistics |
+| `Enter` | play / open / confirm / seek lyric |
 | `Space` | pause / resume |
 | `n` `p` | next / previous track |
 | `←` `→` | seek 5 seconds |
@@ -147,10 +175,16 @@ counted.
 | `r` | cycle repeat (off / all / one) |
 | `a` | add to queue |
 | `A` | add to playlist |
+| `V` | visual select a block |
+| `Shift+J` `Shift+K` | move the selected block down / up |
 | `N` | new playlist |
 | `e` / `F2` | rename selected playlist or track |
 | `Delete` | remove track from the library (choose whether to delete the file) |
 | `d` | remove from queue/playlist, cancel download, or remove a library track |
+| `p` / `P` | paste lyrics |
+| `e` / `E` | edit lyrics in `$EDITOR` |
+| `f` / `F` | refetch lyrics |
+| `[` `]` | shift lyric sync by 0.5 seconds |
 | `i` | download (search or URL) |
 | `/` | filter the current list |
 | `?` | help |
@@ -194,9 +228,18 @@ prev = ["p"]
 pause = ["space"]
 queue_add = ["a"]
 playlist_add = ["A"]
+visual = ["V"]
+move_down = ["J"]
+move_up = ["K"]
 delete_track = ["delete"]
 rename = ["e", "F2"]
-pane_stats = ["5"]
+pane_lyrics = ["5"]
+pane_stats = ["6"]
+lyrics_paste = ["P"]
+lyrics_edit = ["E"]
+lyrics_fetch = ["F"]
+lyrics_offset_back = ["["]
+lyrics_offset_fwd = ["]"]
 download = ["i"]
 ```
 
@@ -204,9 +247,12 @@ Action names: `quit`, `shutdown`, `down`, `up`, `top`, `bottom`, `half_down`,
 `half_up`, `page_down`, `page_up`, `confirm`, `pause`, `next`, `prev`,
 `seek_back`, `seek_fwd`, `seek_back_long`, `seek_fwd_long`, `volume_down`,
 `volume_up`, `mute`, `shuffle`, `repeat`, `queue_add`, `playlist_add`,
-`new_playlist`, `remove`, `delete_track`, `rename`, `filter`, `help`, `tab`,
-`pane_library`, `pane_playlists`, `pane_queue`, `pane_downloads`, `pane_stats`,
-`download`, `playlist_delete`, `cancel`.
+`visual`, `move_down`, `move_up`, `new_playlist`, `remove`, `delete_track`,
+`rename`, `filter`, `help`, `tab`,
+`pane_library`, `pane_playlists`, `pane_queue`, `pane_downloads`,
+`pane_lyrics`, `pane_stats`, `lyrics_paste`, `lyrics_edit`, `lyrics_fetch`,
+`lyrics_offset_back`, `lyrics_offset_fwd`, `download`, `playlist_delete`,
+`cancel`.
 
 Chords use `ctrl+`, `alt+`, and `shift+` prefixes, e.g. `ctrl+d`,
 `shift+left`, `alt+j`. A plain uppercase letter such as `Q` means Shift is
@@ -243,7 +289,7 @@ actions. Snapshot updates are coalesced, playback position is pushed at most
 four times per second, and the daemon idles at 0% CPU when no client is
 attached.
 
-## v0.2 limitations
+## v0.3 limitations
 
 - Only tracks downloaded through the app are indexed. Importing an existing
   music folder is not implemented yet.
@@ -251,12 +297,15 @@ attached.
   untouched.
 - Listening time covers playback through melos only, and is tracked while the
   daemon is running.
-- Album art depends on the terminal: Kitty graphics where supported, otherwise
-  a colored half-block rendering.
+- Album art depends on the terminal: native Kitty graphics in Kitty, otherwise
+  a colored half-block rendering. Set `MELOS_ART=halfblocks` to force the
+  fallback or `MELOS_ART=kitty` to force Kitty graphics.
 - Queue advancement loads one file at a time; mpv's gapless mode helps, but
   this is not sample-perfect album playback.
+- Lyrics come from LRCLIB or manual paste. Ambiguous matches pick one result;
+  there is no candidate picker yet, so use `P`/`E` when a lookup is wrong.
 - Video is never downloaded; audio only.
-- No lyrics, equalizer, scrobbling, or cloud sync. By design.
+- No equalizer, scrobbling, or cloud sync. By design.
 
 ## Legal
 

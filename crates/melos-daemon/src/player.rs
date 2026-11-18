@@ -348,6 +348,37 @@ impl Player {
         self.rebuild_order();
     }
 
+    pub fn move_queue(&mut self, start: usize, len: usize, delta: i8) -> bool {
+        let count = self.queue.len();
+        if len == 0 || start + len > count || !matches!(delta, -1 | 1) {
+            return false;
+        }
+        if delta == 1 {
+            if start + len >= count {
+                return false;
+            }
+            self.queue[start..=start + len].rotate_left(len);
+        } else {
+            if start == 0 {
+                return false;
+            }
+            self.queue[start - 1..=start + len - 1].rotate_right(len);
+        }
+        if let Some(pos) = self.pos {
+            self.pos = Some(if pos >= start && pos < start + len {
+                (pos as isize + delta as isize) as usize
+            } else if delta == 1 && pos == start + len {
+                pos - len
+            } else if delta == -1 && pos == start - 1 {
+                pos + len
+            } else {
+                pos
+            });
+        }
+        self.rebuild_order();
+        true
+    }
+
     pub fn queue_clear(&mut self) {
         self.queue.clear();
         self.pos = None;
@@ -459,6 +490,50 @@ mod tests {
         assert_eq!(player.queue, vec![2, 3]);
         assert_eq!(player.current_id(), Some(3));
         assert!(player.playing);
+    }
+
+    #[test]
+    fn moving_a_queue_block_keeps_the_same_current_track() {
+        let mut player = Player::new(None, 70, false, Repeat::Off);
+        player.queue = vec![1, 2, 3, 4];
+        player.pos = Some(2);
+
+        assert!(player.move_queue(0, 1, 1));
+        assert_eq!(player.queue, vec![2, 1, 3, 4]);
+        assert_eq!(player.current_id(), Some(3));
+
+        assert!(player.move_queue(1, 2, 1));
+        assert_eq!(player.queue, vec![2, 4, 1, 3]);
+        assert_eq!(player.current_id(), Some(3));
+
+        assert!(player.move_queue(2, 2, -1));
+        assert_eq!(player.queue, vec![2, 1, 3, 4]);
+        assert_eq!(player.current_id(), Some(3));
+    }
+
+    #[test]
+    fn moving_a_block_over_the_current_track_keeps_playback_on_it() {
+        let mut player = Player::new(None, 70, false, Repeat::Off);
+        player.queue = vec![1, 2, 3];
+        player.pos = Some(1);
+
+        assert!(player.move_queue(0, 1, 1));
+        assert_eq!(player.queue, vec![2, 1, 3]);
+        assert_eq!(player.current_id(), Some(2));
+
+        assert!(player.move_queue(1, 1, -1));
+        assert_eq!(player.queue, vec![1, 2, 3]);
+        assert_eq!(player.current_id(), Some(2));
+    }
+
+    #[test]
+    fn queue_moves_are_rejected_at_the_edges() {
+        let mut player = Player::new(None, 70, false, Repeat::Off);
+        player.queue = vec![1, 2, 3];
+        assert!(!player.move_queue(0, 1, -1));
+        assert!(!player.move_queue(2, 1, 1));
+        assert!(!player.move_queue(1, 3, 1));
+        assert_eq!(player.queue, vec![1, 2, 3]);
     }
 
     #[test]

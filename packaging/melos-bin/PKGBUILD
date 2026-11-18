@@ -1,6 +1,6 @@
 # Maintainer: ZT <ztthingsgm@gmail.com>
 pkgname=melos-bin
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Fast, minimal TUI music player with YouTube downloads (prebuilt)"
 arch=('x86_64')

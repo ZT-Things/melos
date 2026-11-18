@@ -1,4 +1,4 @@
-.TH MELOS 1 "2026-11-17" "melos 0.2.0" "User Commands"
+.TH MELOS 1 "2026-11-18" "melos 0.3.0" "User Commands"
 .SH NAME
 melos \- fast, minimal terminal music player with YouTube downloads
 .SH SYNOPSIS
@@ -15,8 +15,9 @@ melos \- fast, minimal terminal music player with YouTube downloads
 is a terminal music player. It connects to the resident
 .BR melosd (1)
 daemon, starting it on demand, and displays a keyboard-driven interface for the
-library, playlists, queue, downloads, and listening statistics. The selected
-track's cover art appears in the sidebar when the file has embedded art.
+library, playlists, queue, downloads, lyrics, and listening statistics. The
+selected track's cover art appears in the sidebar when the file has embedded
+art. Lyrics are fetched from LRCLIB and can be pasted or edited manually.
 .PP
 The daemon owns playback and continues when the client exits. Press
 .B q
@@ -63,12 +64,14 @@ Move by half a page or a full page.
 .B Tab
 Switch between the sidebar and the main pane.
 .TP
-.BR 1 " " 2 " " 3 " " 4 " " 5
-Open Library, Playlists, Queue, Downloads, or Statistics. Opening the Library
-moves the cursor to the currently playing track.
+.BR 1 " " 2 " " 3 " " 4 " " 5 " " 6
+Open Library, Playlists, Queue, Downloads, Lyrics, or Statistics. Opening
+Library, a playlist, or the queue moves the cursor to the currently playing
+track.
 .TP
 .B Enter
-Play the selected track, open a playlist, or confirm an input.
+Play the selected track, open a playlist, confirm an input, or seek to the
+selected or current lyric line in the Lyrics pane.
 .TP
 .B Space
 Pause or resume.
@@ -100,6 +103,18 @@ Add the selected track to the queue.
 .B A
 Add the selected track to a playlist.
 .TP
+.B V
+Start or end visual selection in the Library, a playlist, or the queue. Use
+.B j
+and
+.B k
+to extend the selection.
+.TP
+.B J K
+Move the selected block down or up one position. The Library and playlists keep
+this order across restarts; the queue moves the block without changing which
+track is playing.
+.TP
 .B N
 Create a playlist.
 .TP
@@ -114,6 +129,38 @@ the track in melos only and deleting the downloaded audio file as well.
 .BR e ", " F2
 Rename the selected playlist or track. This changes melos' display name only;
 audio tags and filenames are not modified.
+.TP
+.BR p ", " P
+Paste lyrics in the Lyrics pane. LRC timestamps are detected automatically;
+plain text is saved as unsynced lyrics. Press Ctrl+S to save.
+.TP
+.BR e ", " E
+Open the current lyrics in
+.IR $EDITOR .
+.TP
+.BR f ", " F
+Refetch lyrics from LRCLIB.
+.TP
+.B [ ]
+Shift lyric synchronization by half a second.
+.TP
+.BR j ", " k
+Select the next or previous line in synced lyrics, or scroll plain lyrics.
+.TP
+.BR Ctrl+d ", " Ctrl+u
+Move the synced selection or scroll plain lyrics by half a page in the Lyrics
+pane.
+.TP
+.BR PgUp ", " PgDn
+Move the synced selection or scroll plain lyrics by a full page in the Lyrics
+pane.
+.TP
+.B Enter
+Seek to the selected synced lyric line.
+.TP
+.B Esc
+Exit visual selection, or return synced lyrics to following playback after
+selecting a line.
 .TP
 .B i
 Download: enter a search query or a YouTube URL.
@@ -172,6 +219,16 @@ Base directory for extracted cover art.
 .B XDG_RUNTIME_DIR
 Base directory for the client socket. Falls back to
 .IR /tmp/melos\-UID .
+.TP
+.B MELOS_ART
+Select the artwork renderer.
+.B auto
+(the default) uses native Kitty graphics in Kitty and a colored half-block
+rendering elsewhere.
+.B halfblocks
+forces the fallback.
+.B kitty
+forces Kitty graphics.
 .SH EXAMPLES
 Open the player:
 .PP

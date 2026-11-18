@@ -5,20 +5,25 @@ mod client;
 mod keys;
 mod ui;
 
+use std::io::stdout;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event};
-use melos_proto::Action;
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use crossterm::execute;
 use melos_proto::config::Config;
-use ratatui_image::picker::Picker;
+use melos_proto::{Action, paths};
 use ratatui_image::picker::cap_parser::QueryStdioOptions;
+use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
-use crate::app::App;
+use crate::app::{App, View};
 use crate::client::ClientHandle;
 use crate::keys::KeyMap;
 
@@ -49,12 +54,14 @@ enum Cmd {
 
 enum UiEvent {
     Key(crossterm::event::KeyEvent),
+    Paste(String),
     Resize,
 }
 
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -128,8 +135,57 @@ fn wants_graphics_query(
         || kitty_window.is_some()
 }
 
+fn tmux_client_is_kitty(client: &str) -> bool {
+    client.to_ascii_lowercase().contains("kitty")
+}
+
+/// Enable tmux passthrough so the outer terminal can receive Kitty graphics.
+fn enable_tmux_passthrough() {
+    let _ = Command::new("tmux")
+        .args(["set", "-w", "allow-passthrough", "on"])
+        .status();
+}
+
+fn tmux_client_termname() -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "#{client_termname}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+fn kitty_picker() -> Picker {
+    let mut picker = Picker::halfblocks();
+    picker.set_protocol_type(ProtocolType::Kitty);
+    picker
+}
+
 fn detect_picker() -> Picker {
+    let force = std::env::var("MELOS_ART")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let tmux = std::env::var_os("TMUX").is_some();
+    if force == "halfblocks" {
+        return Picker::halfblocks();
+    }
+    if force == "kitty" {
+        if tmux {
+            enable_tmux_passthrough();
+        }
+        return kitty_picker();
+    }
+    if tmux {
+        // Querying stdio under tmux can steal a keypress; ask tmux instead.
+        if tmux_client_termname().is_some_and(|client| tmux_client_is_kitty(&client)) {
+            enable_tmux_passthrough();
+            return kitty_picker();
+        }
+        return Picker::halfblocks();
+    }
     let term = std::env::var("TERM").ok();
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let kitty_window = std::env::var("KITTY_WINDOW_ID").ok();
@@ -167,16 +223,33 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
     let picker = detect_picker();
     let mut terminal = ratatui::init();
     let guard = Restore;
+    execute!(stdout(), EnableBracketedPaste)?;
     app.set_picker(picker);
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     let t_first_frame = t0.elapsed();
 
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<UiEvent>();
+    let input_paused = Arc::new(AtomicBool::new(false));
+    let reader_paused = input_paused.clone();
     std::thread::spawn(move || {
         loop {
+            if reader_paused.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if key_tx.send(UiEvent::Key(key)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    if key_tx.send(UiEvent::Paste(text)).is_err() {
                         break;
                     }
                 }
@@ -209,6 +282,24 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
                             break;
                         }
                         terminal.draw(|frame| ui::draw(frame, &mut app))?;
+                        if let Some((track_id, initial)) = app.take_editor_request() {
+                            input_paused.store(true, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_millis(60));
+                            ratatui::restore();
+                            let edited = edit_lyrics(&initial);
+                            terminal = ratatui::init();
+                            execute!(stdout(), EnableBracketedPaste)?;
+                            input_paused.store(false, Ordering::Relaxed);
+                            terminal.clear()?;
+                            if let Some(text) = edited {
+                                let _ = action_tx.send(Action::SaveLyrics { track_id, text });
+                            }
+                            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+                        }
+                    }
+                    Some(UiEvent::Paste(text)) => {
+                        app.on_paste(&text);
+                        terminal.draw(|frame| ui::draw(frame, &mut app))?;
                     }
                     Some(UiEvent::Resize) => {
                         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -219,7 +310,12 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
             message = server_rx.recv() => {
                 match message {
                     Some(message) => {
+                        let before = app.vm.transport.track.as_ref().map(|t| t.id);
                         app.apply(message);
+                        let after = app.vm.transport.track.as_ref().map(|t| t.id);
+                        if app.view == View::Lyrics && before != after {
+                            let _ = action_tx.send(Action::RequestLyrics { force: false });
+                        }
                         if app.quit {
                             break;
                         }
@@ -257,6 +353,52 @@ async fn run_tui(args: Args, t0: Instant) -> Result<()> {
     Ok(())
 }
 
+fn find_editor() -> Option<String> {
+    for name in ["VISUAL", "EDITOR"] {
+        if let Ok(editor) = std::env::var(name)
+            && !editor.trim().is_empty()
+        {
+            return Some(editor);
+        }
+    }
+    ["vi", "vim", "nano"]
+        .into_iter()
+        .find(|editor| {
+            Command::new(editor)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        })
+        .map(str::to_string)
+}
+
+fn edit_lyrics(initial: &str) -> Option<String> {
+    let path = paths::state_dir().join("lyrics-edit.lrc");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&path, initial).is_err() {
+        return None;
+    }
+    let Some(editor) = find_editor() else {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    };
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(&path)
+        .status();
+    let edited = std::fs::read_to_string(&path)
+        .ok()
+        .filter(|text| !text.trim().is_empty() && text != initial);
+    let _ = std::fs::remove_file(&path);
+    edited
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +423,14 @@ mod tests {
             Some("tmux"),
             None
         ));
+    }
+
+    #[test]
+    fn tmux_outer_terminal_is_detected_as_kitty() {
+        assert!(tmux_client_is_kitty("xterm-kitty"));
+        assert!(tmux_client_is_kitty("kitty(0.49.2)"));
+        assert!(!tmux_client_is_kitty("xterm-256color"));
+        assert!(!tmux_client_is_kitty("screen-256color"));
+        assert!(!tmux_client_is_kitty(""));
     }
 }

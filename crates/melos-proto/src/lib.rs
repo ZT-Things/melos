@@ -4,12 +4,13 @@
 //! [`ViewModel`] it receives. Version is bumped on any breaking wire change.
 
 pub mod config;
+pub mod lyrics;
 pub mod paths;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Bump on every breaking change to the wire format.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Transport / UI model
@@ -169,6 +170,16 @@ impl YtResultRow {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LyricsView {
+    pub track_id: i64,
+    pub plain: String,
+    pub synced: Option<String>,
+    pub source: String,
+    pub offset_ms: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewModel {
     pub daemon_version: String,
@@ -184,6 +195,12 @@ pub struct ViewModel {
     pub transport: Transport,
     #[serde(default)]
     pub stats: Stats,
+    #[serde(default)]
+    pub lyrics: Option<LyricsView>,
+    #[serde(default)]
+    pub lyrics_loading: bool,
+    #[serde(default)]
+    pub lyrics_error: Option<String>,
     pub status: String,
 }
 
@@ -202,6 +219,9 @@ impl Default for ViewModel {
             yt_results: Vec::new(),
             transport: Transport::default(),
             stats: Stats::default(),
+            lyrics: None,
+            lyrics_loading: false,
+            lyrics_error: None,
             status: String::new(),
         }
     }
@@ -211,7 +231,7 @@ impl Default for ViewModel {
 // Actions (client -> daemon)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     PlayTrack {
@@ -258,6 +278,22 @@ pub enum Action {
         index: usize,
     },
     QueueClear,
+    MoveQueue {
+        start: usize,
+        len: usize,
+        delta: i8,
+    },
+    MoveLibrary {
+        start: usize,
+        len: usize,
+        delta: i8,
+    },
+    MovePlaylistTracks {
+        playlist_id: i64,
+        start: usize,
+        len: usize,
+        delta: i8,
+    },
 
     LibraryRefresh,
     DeleteTrack {
@@ -274,6 +310,18 @@ pub enum Action {
         name: String,
     },
     RequestStats,
+    RequestLyrics {
+        #[serde(default)]
+        force: bool,
+    },
+    SaveLyrics {
+        track_id: i64,
+        text: String,
+    },
+    SetLyricsOffset {
+        track_id: i64,
+        offset_ms: i64,
+    },
     CreatePlaylist {
         name: String,
     },
@@ -343,6 +391,15 @@ pub enum ServerMsg {
     },
     Error {
         message: String,
+    },
+    Lyrics {
+        track_id: i64,
+        #[serde(default)]
+        lyrics: Option<LyricsView>,
+        #[serde(default)]
+        loading: bool,
+        #[serde(default)]
+        error: Option<String>,
     },
     Shutdown,
 }
@@ -420,6 +477,31 @@ mod tests {
                 name: "Focus".into(),
             },
             Action::RequestStats,
+            Action::RequestLyrics { force: true },
+            Action::SaveLyrics {
+                track_id: 4,
+                text: "[00:01.00]Hello".into(),
+            },
+            Action::SetLyricsOffset {
+                track_id: 4,
+                offset_ms: -500,
+            },
+            Action::MoveLibrary {
+                start: 1,
+                len: 2,
+                delta: 1,
+            },
+            Action::MovePlaylistTracks {
+                playlist_id: 2,
+                start: 3,
+                len: 1,
+                delta: -1,
+            },
+            Action::MoveQueue {
+                start: 0,
+                len: 2,
+                delta: 1,
+            },
         ];
         for a in acts {
             let s = serde_json::to_string(&a).unwrap();
@@ -446,6 +528,50 @@ mod tests {
         .unwrap();
         assert_eq!(vm.stats.total_ms, 0);
         assert!(vm.stats.days.is_empty());
+        assert!(vm.lyrics.is_none());
+        assert!(!vm.lyrics_loading);
+        assert!(vm.lyrics_error.is_none());
+    }
+
+    #[test]
+    fn lyrics_message_roundtrip() {
+        let msg = ServerMsg::Lyrics {
+            track_id: 4,
+            lyrics: Some(LyricsView {
+                track_id: 4,
+                plain: "Hello".into(),
+                synced: Some("[00:01.00]Hello".into()),
+                source: "manual".into(),
+                offset_ms: -250,
+                updated_at: 1,
+            }),
+            loading: false,
+            error: None,
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), s);
+    }
+
+    #[test]
+    fn parses_lrc_and_finds_the_current_line() {
+        let lrc =
+            "[ar:Artist]\n[00:01.00]First line\n[00:05.50][00:09.00]Chorus\n[00:12.25] Last line ";
+        let lines = crate::lyrics::parse_lrc(lrc);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].timestamp_ms, 1_000);
+        assert_eq!(lines[0].text, "First line");
+        assert_eq!(lines[1].timestamp_ms, 5_500);
+        assert_eq!(lines[1].text, "Chorus");
+        assert_eq!(lines[2].timestamp_ms, 9_000);
+        assert_eq!(lines[3].text, "Last line");
+        assert_eq!(crate::lyrics::current_line(&lines, 6_000, 0), Some(1));
+        assert_eq!(crate::lyrics::current_line(&lines, 6_000, 3_500), Some(2));
+        assert_eq!(crate::lyrics::current_line(&lines, 500, 0), None);
+        assert_eq!(
+            crate::lyrics::plain_from_lrc(lrc),
+            "First line\nChorus\nChorus\nLast line"
+        );
     }
 
     #[test]

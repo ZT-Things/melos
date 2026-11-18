@@ -4,6 +4,7 @@
 mod art;
 mod db;
 mod download;
+mod lyrics;
 mod mpris;
 mod mpv;
 mod player;

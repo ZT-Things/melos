@@ -12,7 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-const LEGACY_PROTOCOL: u32 = 1;
+/// Protocol versions that can still be asked to shut down during an upgrade.
+const LEGACY_PROTOCOLS: &[u32] = &[3, 2, 1];
 
 #[derive(Debug)]
 pub struct ClientHandle {
@@ -77,11 +78,14 @@ pub async fn connect(spawn: bool) -> Result<(ClientHandle, ViewModel)> {
         return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("melosd is not running")));
     }
 
-    if last_error
+    if let Some(mismatch) = last_error
         .as_ref()
-        .is_some_and(|error| error.downcast_ref::<ProtocolMismatch>().is_some())
+        .and_then(|error| error.downcast_ref::<ProtocolMismatch>())
     {
-        retire_legacy(&path).await;
+        let protocol = mismatch
+            .daemon
+            .filter(|protocol| LEGACY_PROTOCOLS.contains(protocol));
+        retire_legacy(&path, protocol).await;
     }
 
     // Socket activation may already own the socket, so a bind error here is
@@ -102,9 +106,7 @@ pub async fn connect(spawn: bool) -> Result<(ClientHandle, ViewModel)> {
     }
 
     if saw_mismatch {
-        bail!(
-            "an older melosd (protocol {LEGACY_PROTOCOL}) is still running — run `melos stop`, then start melos again"
-        );
+        bail!("an older melosd is still running — run `melos stop`, then start melos again");
     }
     if let Some(error) = spawn_error {
         return Err(error.context(format!("could not connect to melosd at {}", path.display())));
@@ -126,25 +128,45 @@ pub async fn probe() -> Result<(ClientHandle, ViewModel)> {
         Ok(pair) => return Ok(pair),
         Err(error) => error,
     };
-    if error.downcast_ref::<ProtocolMismatch>().is_some()
-        && let Ok(pair) = connect_once_with_protocol(&path, LEGACY_PROTOCOL).await
-    {
-        return Ok(pair);
+    if let Some(mismatch) = error.downcast_ref::<ProtocolMismatch>() {
+        let protocols: Vec<u32> = match mismatch
+            .daemon
+            .filter(|protocol| LEGACY_PROTOCOLS.contains(protocol))
+        {
+            Some(protocol) => vec![protocol],
+            None => LEGACY_PROTOCOLS.to_vec(),
+        };
+        for protocol in protocols {
+            if let Ok(pair) = connect_once_with_protocol(&path, protocol).await {
+                return Ok(pair);
+            }
+        }
     }
     Err(error)
 }
 
-/// Ask a protocol-1 daemon to shut down so a freshly installed daemon can take
-/// over the socket. Best effort: a failed retirement just falls back to the
-/// normal connect error.
-async fn retire_legacy(path: &Path) -> bool {
-    let Ok((handle, _)) = connect_once_with_protocol(path, LEGACY_PROTOCOL).await else {
+/// Ask an older daemon to shut down so a freshly installed daemon can take
+/// over the socket. Best effort: a failed retirement falls back to the normal
+/// connect error.
+async fn retire_legacy(path: &Path, protocol: Option<u32>) -> bool {
+    let protocols: Vec<u32> = match protocol {
+        Some(protocol) => vec![protocol],
+        None => LEGACY_PROTOCOLS.to_vec(),
+    };
+    let mut accepted = None;
+    for protocol in protocols {
+        if let Ok((handle, _)) = connect_once_with_protocol(path, protocol).await {
+            let _ = handle.tx.send(Action::Shutdown);
+            accepted = Some(protocol);
+            break;
+        }
+    }
+    let Some(protocol) = accepted else {
         return false;
     };
-    let _ = handle.tx.send(Action::Shutdown);
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(10)).await;
-        match connect_once_with_protocol(path, LEGACY_PROTOCOL).await {
+        match connect_once_with_protocol(path, protocol).await {
             // Still the old daemon; give mpv and the daemon time to exit.
             Ok(_) => {}
             Err(error) => {
@@ -360,10 +382,10 @@ mod tests {
             let mut lines = BufReader::new(read).lines();
             let hello = lines.next_line().await.unwrap().unwrap();
             let hello: ClientMsg = serde_json::from_str(&hello).unwrap();
-            assert!(matches!(hello, ClientMsg::Hello { protocol: 1, .. }));
+            assert!(matches!(hello, ClientMsg::Hello { protocol: 3, .. }));
             let reply = serde_json::to_string(&ServerMsg::Welcome {
-                protocol: 1,
-                daemon_version: "0.1.0".into(),
+                protocol: 3,
+                daemon_version: "0.3.0".into(),
                 snapshot: ViewModel::default(),
             })
             .unwrap();
@@ -384,7 +406,7 @@ mod tests {
             drop(listener);
         });
 
-        assert!(retire_legacy(&path).await);
+        assert!(retire_legacy(&path, Some(3)).await);
         server.await.unwrap();
         let _ = std::fs::remove_file(&path);
     }
