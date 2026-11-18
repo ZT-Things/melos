@@ -11,7 +11,7 @@ optdepends=('ffmpeg: audio extraction and thumbnail embedding for yt-dlp')
 provides=('melos')
 conflicts=('melos' 'melos-git')
 source=("melos-$pkgver-x86_64-unknown-linux-gnu.tar.gz::$url/releases/download/v$pkgver/melos-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('SKIP')  # TODO: v0.4.0 release checksum
+sha256sums=('b7ecd7f9aeed7e0039c175ff22f89e6c6bf760151f6f92f1b8f8ffa1ce743f66')
 
 package() {
     cd "melos-$pkgver"
