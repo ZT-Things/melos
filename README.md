@@ -1,14 +1,15 @@
 # melos
 
-A fast, minimal terminal music player. Search YouTube, download audio, build
-playlists, and play everything from a clean keyboard-driven interface.
+A fast, minimal terminal music player for your local files. Index the folders
+you choose, search YouTube and download audio, build playlists, and play
+everything from a clean keyboard-driven interface.
 
 `melos` is a thin TUI client. A resident daemon (`melosd`) owns the library,
 downloads, playback and MPRIS, so opening the interface is instant and music
 keeps playing after you close it.
 
 ```
-┌ melos v0.3.0 ────────┬ Library ──────────────────────────────────────────┐
+┌ melos v0.4.0 ────────┬ Library ──────────────────────────────────────────┐
 │ ▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄ │   A Short Walk With You       Purrple Cat   1:32  │
 │ ▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀ │ ▶ Night Drive                 Nils          4:10  │
 │ A Short Walk With... │   Rain on Glass               ...           3:58  │
@@ -28,6 +29,9 @@ keeps playing after you close it.
   UI is closed. `q` detaches, `Q` stops playback and exits.
 - **Keyboard first** — vim-style `j`/`k`, plus arrows, `space`, `n`/`p`, `/`,
   and other shortcuts you already know. Every binding is remappable.
+- **Your own music** — add folders or single audio files, either indexing them
+  where they are or copying them into the melos library. Sources can be
+  forgotten and added back without losing playlists or listening history.
 - **YouTube downloads** — search from inside the app or paste a URL. Downloads
   run concurrently in the background while you keep browsing.
 - **Playlists** — create, rename, add tracks, remove tracks, and play from any
@@ -46,8 +50,8 @@ keeps playing after you close it.
   `org.mpris.MediaPlayer2.melos`, even with no UI attached.
 - **Small and quiet** — Rust, ratatui, SQLite index, mpv for audio. Idle CPU is
   effectively zero, and the daemon does no work while no client is attached.
-- **No account, no cloud** — files live in `~/Music/melos`; the database is only
-  an index and can be rebuilt from the files.
+- **No account, no cloud** — files live where you choose; the database is only
+  an index and can be rebuilt by rescanning your sources.
 
 ## Install
 
@@ -87,8 +91,34 @@ install -Dm755 target/release/melosd ~/.local/bin/melosd
 melos                  # open the player (starts the daemon if needed)
 melos status           # is the daemon running, what is playing?
 melos stop             # stop playback and shut the daemon down
+melos import ~/Music/Albums   # add a folder in place
+melos import --copy ~/Music/Albums
+melos scan             # rescan every active source
 melos --trace-startup  # print startup timings when the UI exits
 ```
+
+`melos import` accepts several paths. Without `--copy`, files stay where they
+are; with `--copy`, each folder or file is copied into
+`~/Music/melos/Imported/`.
+
+### Music sources
+
+`~/Music/melos` is always available and is where downloads and copied imports
+live. To add music from elsewhere, press `I` and choose `a`, or use
+`melos import`. A source can be a folder or a single audio file.
+
+- **Keep in place** indexes the original path. Nothing is copied or moved.
+- **Copy into the library** copies the folder or file to
+  `~/Music/melos/Imported/`. The original is untouched; an existing target is
+  reported instead of being overwritten.
+
+Sources are scanned in the background after you add them and when the first
+client connects, so opening melos stays instant. New files append to the
+Library's manual order. Use `I` to inspect sources, `Enter` to rescan the
+selected one, `R` to rescan everything, and `d` to forget one. Forgetting is
+reversible: files stay on disk, and tracks, playlists and listening history are
+kept; add the same path again to restore them. Nested or overlapping sources
+are rejected so a track is indexed once.
 
 ### Downloading music
 
@@ -145,7 +175,7 @@ Press `Delete` (or `d` in the Library) on a track. A dialog offers:
   cannot be undone.
 
 Safe removal is selected first. File deletion is refused for anything outside
-the configured music directory.
+the managed music directory or an active source you added.
 
 ### Listening statistics
 
@@ -164,6 +194,8 @@ counted.
 | `PgDn` `PgUp` | page down / up |
 | `Tab` | switch between sidebar and main pane |
 | `1` `2` `3` `4` `5` `6` | Library, Playlists, Queue, Downloads, Lyrics, Statistics |
+| `I` | music sources overlay |
+| `R` | rescan every active source |
 | `Enter` | play / open / confirm / seek lyric |
 | `Space` | pause / resume |
 | `n` `p` | next / previous track |
@@ -235,6 +267,8 @@ delete_track = ["delete"]
 rename = ["e", "F2"]
 pane_lyrics = ["5"]
 pane_stats = ["6"]
+sources = ["I"]
+rescan = ["R"]
 lyrics_paste = ["P"]
 lyrics_edit = ["E"]
 lyrics_fetch = ["F"]
@@ -250,7 +284,7 @@ Action names: `quit`, `shutdown`, `down`, `up`, `top`, `bottom`, `half_down`,
 `visual`, `move_down`, `move_up`, `new_playlist`, `remove`, `delete_track`,
 `rename`, `filter`, `help`, `tab`,
 `pane_library`, `pane_playlists`, `pane_queue`, `pane_downloads`,
-`pane_lyrics`, `pane_stats`, `lyrics_paste`, `lyrics_edit`, `lyrics_fetch`,
+`pane_lyrics`, `pane_stats`, `sources`, `rescan`, `lyrics_paste`, `lyrics_edit`, `lyrics_fetch`,
 `lyrics_offset_back`, `lyrics_offset_fwd`, `download`, `playlist_delete`,
 `cancel`.
 
@@ -262,8 +296,9 @@ required.
 
 | Path | Purpose |
 | --- | --- |
-| `~/Music/melos/` | downloaded audio files |
-| `~/.local/share/melos/library.db` | SQLite index (safe to delete) |
+| `~/Music/melos/` | managed library: downloads and copied imports |
+| `~/Music/melos/Imported/` | copies made with `melos import --copy` |
+| `~/.local/share/melos/library.db` | SQLite index, sources, playlists, lyrics and stats |
 | `~/.local/state/melos/state.json` | queue, position, volume, shuffle/repeat |
 | `~/.local/state/melos/daemon.log` | daemon output when spawned by the TUI |
 | `$XDG_RUNTIME_DIR/melos/daemon.sock` | client/daemon socket |
@@ -289,10 +324,16 @@ actions. Snapshot updates are coalesced, playback position is pushed at most
 four times per second, and the daemon idles at 0% CPU when no client is
 attached.
 
-## v0.3 limitations
+## v0.4 limitations
 
-- Only tracks downloaded through the app are indexed. Importing an existing
-  music folder is not implemented yet.
+- Music sources are scanned when added, on the first client connection, and
+  when you press `R`; there is no live filesystem watcher yet.
+- Moving or renaming files outside melos is treated as a removed file plus a new
+  one. Hash-based move detection and automatic tag editing are not implemented.
+- There is no album/artist browser yet; the Library is a single manual-order
+  list.
+- Copy imports show a scanning status but do not offer per-file progress or a
+  cancel button yet. Keep in place if a large copy would be inconvenient.
 - Renaming changes melos' display name only; audio tags and filenames are left
   untouched.
 - Listening time covers playback through melos only, and is tracked while the

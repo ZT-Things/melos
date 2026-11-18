@@ -137,6 +137,8 @@ pub fn default_keys() -> BTreeMap<String, Vec<String>> {
         ("pane_downloads", &["4"]),
         ("pane_lyrics", &["5"]),
         ("pane_stats", &["6"]),
+        ("sources", &["I"]),
+        ("rescan", &["R"]),
         ("lyrics_paste", &["P"]),
         ("lyrics_edit", &["E"]),
         ("lyrics_fetch", &["F"]),

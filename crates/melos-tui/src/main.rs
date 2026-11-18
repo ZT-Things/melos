@@ -17,11 +17,11 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use crossterm::execute;
 use melos_proto::config::Config;
-use melos_proto::{Action, paths};
+use melos_proto::{Action, ServerMsg, ViewModel, paths};
 use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 
 use crate::app::{App, View};
 use crate::client::ClientHandle;
@@ -50,6 +50,16 @@ enum Cmd {
     Status,
     /// Stop playback and shut down the daemon
     Stop,
+    /// Add folders or audio files to the music library
+    Import {
+        /// Files or folders to index
+        paths: Vec<PathBuf>,
+        /// Copy the files into the melos library instead of indexing in place
+        #[arg(long)]
+        copy: bool,
+    },
+    /// Rescan every active music source
+    Scan,
 }
 
 enum UiEvent {
@@ -73,6 +83,8 @@ async fn main() -> Result<()> {
     match args.cmd {
         Some(Cmd::Status) => return status().await,
         Some(Cmd::Stop) => return stop().await,
+        Some(Cmd::Import { paths, copy }) => return import(paths, copy).await,
+        Some(Cmd::Scan) => return scan().await,
         None => {}
     }
     run_tui(args, t0).await
@@ -116,6 +128,70 @@ async fn stop() -> Result<()> {
         Err(_) => println!("melosd is not running"),
     }
     Ok(())
+}
+
+async fn import(paths: Vec<PathBuf>, copy: bool) -> Result<()> {
+    if paths.is_empty() {
+        anyhow::bail!("give at least one file or folder to import");
+    }
+    let (mut handle, mut vm) = client::connect(true).await?;
+    vm = wait_for_scan(&mut handle, vm).await;
+    for path in paths {
+        let path = path.to_string_lossy().into_owned();
+        handle.tx.send(Action::AddSource {
+            path: path.clone(),
+            copy,
+        })?;
+        vm = wait_for_scan(&mut handle, vm).await;
+        println!("{path}: {}", vm.status);
+    }
+    println!(
+        "{} tracks in the library across {} sources",
+        vm.tracks.len(),
+        vm.sources.len()
+    );
+    Ok(())
+}
+
+async fn scan() -> Result<()> {
+    let (mut handle, mut vm) = client::connect(true).await?;
+    vm = wait_for_scan(&mut handle, vm).await;
+    handle.tx.send(Action::RescanAll)?;
+    vm = wait_for_scan(&mut handle, vm).await;
+    println!("{} tracks in the library", vm.tracks.len());
+    println!("{}", vm.status);
+    Ok(())
+}
+
+async fn wait_for_scan(handle: &mut ClientHandle, mut vm: ViewModel) -> ViewModel {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut quiet_since: Option<Instant> = None;
+    loop {
+        if vm.scanning {
+            quiet_since = None;
+        } else if let Some(since) = quiet_since {
+            if since.elapsed() >= Duration::from_millis(300) {
+                return vm;
+            }
+        } else {
+            quiet_since = Some(Instant::now());
+        }
+        if Instant::now() >= deadline {
+            return vm;
+        }
+        match timeout(Duration::from_millis(100), handle.rx.recv()).await {
+            Ok(Some(ServerMsg::State { snapshot }))
+            | Ok(Some(ServerMsg::Welcome { snapshot, .. })) => {
+                vm = snapshot;
+            }
+            Ok(Some(ServerMsg::Error { message })) => {
+                vm.status = message;
+                return vm;
+            }
+            Ok(Some(ServerMsg::Shutdown)) | Ok(None) => return vm,
+            Ok(Some(_)) | Err(_) => {}
+        }
+    }
 }
 
 /// Terminal stdio queries can consume a keypress and briefly leave raw mode, so

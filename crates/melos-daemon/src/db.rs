@@ -1,9 +1,12 @@
 //! SQLite index over the downloaded files. Files are the source of truth.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use melos_proto::{DayStat, LyricsView, NameStat, PlaylistRow, Stats, TrackRow, TrackStat};
+use melos_proto::{
+    DayStat, LyricsView, NameStat, PlaylistRow, SourceKind, SourceRow, Stats, TrackRow, TrackStat,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub struct Db {
@@ -19,6 +22,7 @@ pub struct NewTrack {
     pub album: Option<String>,
     pub duration_ms: u64,
     pub mtime: i64,
+    pub source_id: Option<i64>,
 }
 
 impl Db {
@@ -43,6 +47,15 @@ impl Db {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS sources (
+              id        INTEGER PRIMARY KEY AUTOINCREMENT,
+              path      TEXT NOT NULL UNIQUE,
+              kind      TEXT NOT NULL,
+              active    INTEGER NOT NULL DEFAULT 1,
+              added_at  INTEGER NOT NULL,
+              last_scan INTEGER
+            );
+
             CREATE TABLE IF NOT EXISTS tracks (
               id          INTEGER PRIMARY KEY AUTOINCREMENT,
               path        TEXT NOT NULL UNIQUE,
@@ -56,7 +69,8 @@ impl Db {
               play_count  INTEGER NOT NULL DEFAULT 0,
               file_mtime  INTEGER NOT NULL DEFAULT 0,
               missing     INTEGER NOT NULL DEFAULT 0,
-              position    INTEGER NOT NULL DEFAULT 0
+              position    INTEGER NOT NULL DEFAULT 0,
+              source_id   INTEGER REFERENCES sources(id) ON DELETE SET NULL
             );
             CREATE INDEX IF NOT EXISTS tracks_title ON tracks(title);
 
@@ -100,8 +114,26 @@ impl Db {
             );
             "#,
         )?;
+        self.ensure_source_schema()?;
         self.ensure_library_position()?;
         self.ensure_autoincrement()?;
+        Ok(())
+    }
+
+    fn ensure_source_schema(&self) -> Result<()> {
+        let has_source: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tracks') WHERE name = 'source_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_source == 0 {
+            self.conn.execute_batch(
+                "ALTER TABLE tracks ADD COLUMN source_id INTEGER
+                   REFERENCES sources(id) ON DELETE SET NULL;",
+            )?;
+        }
+        self.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS tracks_source ON tracks(source_id);")?;
         Ok(())
     }
 
@@ -167,18 +199,20 @@ impl Db {
                play_count  INTEGER NOT NULL DEFAULT 0,
                file_mtime  INTEGER NOT NULL DEFAULT 0,
                missing     INTEGER NOT NULL DEFAULT 0,
-               position    INTEGER NOT NULL DEFAULT 0
+               position    INTEGER NOT NULL DEFAULT 0,
+               source_id   INTEGER REFERENCES sources(id) ON DELETE SET NULL
              );
              INSERT INTO tracks_new
                (id, path, yt_id, title, artist, album, duration_ms, added_at,
-                last_played, play_count, file_mtime, missing, position)
+                last_played, play_count, file_mtime, missing, position, source_id)
              SELECT id, path, yt_id, title, artist, album, duration_ms, added_at,
-                    last_played, play_count, file_mtime, missing, position
+                    last_played, play_count, file_mtime, missing, position, source_id
              FROM tracks;
              DROP TABLE tracks;
              ALTER TABLE tracks_new RENAME TO tracks;
              CREATE INDEX IF NOT EXISTS tracks_title ON tracks(title);
              CREATE INDEX IF NOT EXISTS tracks_position ON tracks(position);
+             CREATE INDEX IF NOT EXISTS tracks_source ON tracks(source_id);
              COMMIT;",
         );
         self.conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -191,8 +225,10 @@ impl Db {
 
     pub fn rows(&self) -> Result<Vec<TrackRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, artist, album, duration_ms, missing
-             FROM tracks ORDER BY position, id",
+            "SELECT t.id, t.title, t.artist, t.album, t.duration_ms, t.missing
+             FROM tracks t LEFT JOIN sources s ON s.id = t.source_id
+             WHERE t.source_id IS NULL OR s.active = 1
+             ORDER BY t.position, t.id",
         )?;
         let rows = stmt
             .query_map([], row_to_track)?
@@ -240,17 +276,19 @@ impl Db {
         let id = self.conn.query_row(
             r#"
             INSERT INTO tracks (path, yt_id, title, artist, album, duration_ms,
-                                added_at, file_mtime, missing, position)
+                                added_at, file_mtime, missing, position, source_id)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0,
-                    (SELECT COALESCE(MAX(position) + 1, 0) FROM tracks))
-            ON CONFLICT(yt_id) DO UPDATE SET
+                    (SELECT COALESCE(MAX(position) + 1, 0) FROM tracks), ?9)
+            ON CONFLICT DO UPDATE SET
                 path = excluded.path,
+                yt_id = excluded.yt_id,
                 title = excluded.title,
                 artist = excluded.artist,
                 album = excluded.album,
                 duration_ms = excluded.duration_ms,
                 file_mtime = excluded.file_mtime,
-                missing = 0
+                missing = 0,
+                source_id = COALESCE(excluded.source_id, tracks.source_id)
             RETURNING id
             "#,
             params![
@@ -261,11 +299,154 @@ impl Db {
                 t.album,
                 t.duration_ms as i64,
                 now,
-                t.mtime
+                t.mtime,
+                t.source_id
             ],
             |r| r.get(0),
         )?;
         Ok(id)
+    }
+
+    pub fn upsert_scanned(&self, t: &NewTrack) -> Result<i64> {
+        let now = now_unix();
+        let id = self.conn.query_row(
+            r#"
+            INSERT INTO tracks (path, yt_id, title, artist, album, duration_ms,
+                                added_at, file_mtime, missing, position, source_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0,
+                    (SELECT COALESCE(MAX(position) + 1, 0) FROM tracks), ?9)
+            ON CONFLICT(path) DO UPDATE SET
+                title = excluded.title,
+                artist = excluded.artist,
+                album = excluded.album,
+                duration_ms = excluded.duration_ms,
+                file_mtime = excluded.file_mtime,
+                missing = 0,
+                source_id = COALESCE(excluded.source_id, tracks.source_id)
+            RETURNING id
+            "#,
+            params![
+                t.path,
+                t.yt_id,
+                t.title,
+                t.artist,
+                t.album,
+                t.duration_ms as i64,
+                now,
+                t.mtime,
+                t.source_id
+            ],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn ensure_managed_source(&self, path: &Path) -> Result<i64> {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("creating music directory {}", path.display()))?;
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("resolving music directory {}", path.display()))?;
+        let id = self.add_source(&canonical.to_string_lossy(), SourceKind::Managed)?;
+        self.conn.execute(
+            "UPDATE tracks SET source_id = ?1 WHERE source_id IS NULL",
+            params![id],
+        )?;
+        Ok(id)
+    }
+
+    pub fn add_source(&self, path: &str, kind: SourceKind) -> Result<i64> {
+        let id = self.conn.query_row(
+            "INSERT INTO sources (path, kind, active, added_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(path) DO UPDATE SET kind = excluded.kind, active = 1
+             RETURNING id",
+            params![path, kind.label(), now_unix()],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn sources(&self) -> Result<Vec<SourceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.path, s.kind, s.active,
+                    (SELECT COUNT(*) FROM tracks t WHERE t.source_id = s.id),
+                    s.last_scan
+             FROM sources s
+             ORDER BY CASE s.kind WHEN 'managed' THEN 0 WHEN 'folder' THEN 1 ELSE 2 END,
+                      s.path COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SourceRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    kind: source_kind(&r.get::<_, String>(2)?),
+                    active: r.get::<_, i64>(3)? != 0,
+                    tracks: r.get::<_, i64>(4)?.max(0) as u64,
+                    last_scan: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn active_sources(&self) -> Result<Vec<SourceRow>> {
+        Ok(self.sources()?.into_iter().filter(|s| s.active).collect())
+    }
+
+    pub fn set_source_active(&self, id: i64, active: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sources SET active = ?2 WHERE id = ?1",
+            params![id, active as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_source_last_scan(&self, id: i64, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sources SET last_scan = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn path_mtimes(&self, source_id: i64) -> Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, file_mtime FROM tracks WHERE source_id = ?1 AND missing = 0")?;
+        let rows = stmt
+            .query_map(params![source_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<String, i64>>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_missing_for_source(&self, source_id: i64, seen: &[String]) -> Result<()> {
+        if seen.is_empty() {
+            self.conn.execute(
+                "UPDATE tracks SET missing = 1 WHERE source_id = ?1",
+                params![source_id],
+            )?;
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", seen.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&source_id];
+        for path in seen {
+            values.push(path);
+        }
+        let present = format!(
+            "UPDATE tracks SET missing = 0
+             WHERE source_id = ?1 AND path IN ({placeholders})"
+        );
+        self.conn.execute(&present, values.as_slice())?;
+        let missing = format!(
+            "UPDATE tracks SET missing = 1
+             WHERE source_id = ?1 AND path NOT IN ({placeholders})"
+        );
+        self.conn.execute(&missing, values.as_slice())?;
+        Ok(())
     }
 
     pub fn bump_play_count(&self, id: i64) -> Result<()> {
@@ -287,7 +468,12 @@ impl Db {
     pub fn playlists(&self) -> Result<Vec<PlaylistRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.name,
-                    (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id)
+                    (SELECT COUNT(*)
+                     FROM playlist_tracks pt
+                     JOIN tracks t ON t.id = pt.track_id
+                     LEFT JOIN sources s ON s.id = t.source_id
+                     WHERE pt.playlist_id = p.id
+                       AND (t.source_id IS NULL OR s.active = 1))
              FROM playlists p ORDER BY p.sort_order, p.name COLLATE NOCASE",
         )?;
         let rows = stmt
@@ -326,8 +512,11 @@ impl Db {
     pub fn playlist_tracks(&self, id: i64) -> Result<Vec<TrackRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.title, t.artist, t.album, t.duration_ms, t.missing
-             FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id
-             WHERE pt.playlist_id = ?1 ORDER BY pt.position",
+             FROM playlist_tracks pt
+             JOIN tracks t ON t.id = pt.track_id
+             LEFT JOIN sources s ON s.id = t.source_id
+             WHERE pt.playlist_id = ?1 AND (t.source_id IS NULL OR s.active = 1)
+             ORDER BY pt.position",
         )?;
         let rows = stmt
             .query_map(params![id], row_to_track)?
@@ -630,6 +819,14 @@ fn move_block<T: Copy>(items: &mut [T], start: usize, len: usize, delta: i8) -> 
     true
 }
 
+fn source_kind(value: &str) -> SourceKind {
+    match value {
+        "managed" => SourceKind::Managed,
+        "file" => SourceKind::File,
+        _ => SourceKind::Folder,
+    }
+}
+
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -645,13 +842,18 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;
+             CREATE TABLE sources (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE,
+               kind TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+               added_at INTEGER NOT NULL, last_scan INTEGER);
              CREATE TABLE tracks (
                id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, yt_id TEXT NOT NULL UNIQUE,
                title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
                duration_ms INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL,
                last_played INTEGER, play_count INTEGER NOT NULL DEFAULT 0,
                file_mtime INTEGER NOT NULL DEFAULT 0, missing INTEGER NOT NULL DEFAULT 0,
-               position INTEGER NOT NULL DEFAULT 0);
+               position INTEGER NOT NULL DEFAULT 0,
+               source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL);
              CREATE TABLE playlists (
                id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
                created_at INTEGER NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0);
@@ -684,6 +886,20 @@ mod tests {
             album: None,
             duration_ms: 1000,
             mtime: 1,
+            source_id: None,
+        }
+    }
+
+    fn sourced_track(n: &str, source_id: i64) -> NewTrack {
+        NewTrack {
+            path: format!("/tmp/source-{source_id}/{n}.opus"),
+            yt_id: format!("local:{n}"),
+            title: n.into(),
+            artist: "Artist".into(),
+            album: None,
+            duration_ms: 1000,
+            mtime: 1,
+            source_id: Some(source_id),
         }
     }
 
@@ -694,6 +910,126 @@ mod tests {
         let again = db.insert(&track("a")).unwrap();
         assert_eq!(id, again);
         assert_eq!(db.rows().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn managed_source_attaches_existing_tracks_and_counts_them() {
+        let db = mem_db();
+        let id = db.insert(&track("a")).unwrap();
+        let root = std::env::temp_dir().join(format!("melos-managed-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let managed = db.ensure_managed_source(&root).unwrap();
+        let sources = db.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, managed);
+        assert_eq!(sources[0].kind, melos_proto::SourceKind::Managed);
+        assert!(sources[0].active);
+        assert_eq!(sources[0].tracks, 1);
+        let stored: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT source_id FROM tracks WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, Some(managed));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_source_hides_its_tracks_until_it_is_added_back() {
+        let db = mem_db();
+        let source = db
+            .add_source("/tmp/melos-source-folder", melos_proto::SourceKind::Folder)
+            .unwrap();
+        let id = db.insert(&sourced_track("a", source)).unwrap();
+        let playlist = db.create_playlist("Mix").unwrap();
+        db.add_to_playlist(playlist, id).unwrap();
+        assert_eq!(db.rows().unwrap().len(), 1);
+        assert_eq!(db.playlist_tracks(playlist).unwrap().len(), 1);
+
+        db.set_source_active(source, false).unwrap();
+        assert!(db.rows().unwrap().is_empty());
+        assert!(db.playlist_tracks(playlist).unwrap().is_empty());
+        assert_eq!(db.playlists().unwrap()[0].count, 0);
+        assert!(db.track(id).unwrap().is_some());
+        assert_eq!(db.sources().unwrap()[0].tracks, 1);
+
+        let again = db
+            .add_source("/tmp/melos-source-folder", melos_proto::SourceKind::Folder)
+            .unwrap();
+        assert_eq!(again, source);
+        assert_eq!(db.rows().unwrap().len(), 1);
+        assert_eq!(db.playlist_tracks(playlist).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scanned_upsert_keeps_a_downloaded_yt_id_and_marks_removed_files() {
+        let db = mem_db();
+        let source = db
+            .add_source("/tmp/melos-scan-folder", melos_proto::SourceKind::Folder)
+            .unwrap();
+        let mut downloaded = sourced_track("downloaded", source);
+        downloaded.yt_id = "dQw4w9WgXcQ".into();
+        let id = db.insert(&downloaded).unwrap();
+
+        let mut scanned = downloaded.clone();
+        scanned.yt_id = format!("local:{}", downloaded.path);
+        scanned.title = "Retagged".into();
+        scanned.mtime = 2;
+        assert_eq!(db.upsert_scanned(&scanned).unwrap(), id);
+        let stored: (String, String) = db
+            .conn
+            .query_row(
+                "SELECT yt_id, title FROM tracks WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("dQw4w9WgXcQ".into(), "Retagged".into()));
+
+        db.mark_missing_for_source(source, &[]).unwrap();
+        assert!(db.rows().unwrap()[0].missing);
+        db.mark_missing_for_source(source, &[downloaded.path.clone()])
+            .unwrap();
+        assert!(!db.rows().unwrap()[0].missing);
+    }
+
+    #[test]
+    fn insert_handles_a_path_conflict_with_a_different_yt_id() {
+        let db = mem_db();
+        let source = db
+            .add_source("/tmp/melos-conflict", melos_proto::SourceKind::Folder)
+            .unwrap();
+        let mut local = sourced_track("same-file", source);
+        local.yt_id = "local:/tmp/melos-conflict/same-file.opus".into();
+        let id = db.insert(&local).unwrap();
+        let mut downloaded = local.clone();
+        downloaded.yt_id = "abc123".into();
+        downloaded.title = "Downloaded".into();
+        assert_eq!(db.insert(&downloaded).unwrap(), id);
+        let stored: String = db
+            .conn
+            .query_row("SELECT yt_id FROM tracks WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "abc123");
+        assert_eq!(db.rows().unwrap()[0].title, "Downloaded");
+    }
+
+    #[test]
+    fn path_mtimes_exclude_missing_tracks() {
+        let db = mem_db();
+        let source = db
+            .add_source("/tmp/melos-mtimes", melos_proto::SourceKind::Folder)
+            .unwrap();
+        let id = db.insert(&sourced_track("a", source)).unwrap();
+        let map = db.path_mtimes(source).unwrap();
+        assert_eq!(map.get("/tmp/source-1/a.opus"), Some(&1));
+        db.set_missing(id, true).unwrap();
+        assert!(db.path_mtimes(source).unwrap().is_empty());
     }
 
     #[test]

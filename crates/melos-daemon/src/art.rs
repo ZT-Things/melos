@@ -20,18 +20,53 @@ pub fn extract(track_id: i64, source: &Path, mtime: u64) -> Option<String> {
 }
 
 fn extract_to(track_id: i64, source: &Path, mtime: u64, cache: &Path) -> Result<Option<PathBuf>> {
-    let tagged = Probe::open(source)
-        .with_context(|| format!("opening {}", source.display()))?
-        .read()
-        .with_context(|| format!("reading tags from {}", source.display()))?;
-    let picture = tagged
-        .primary_tag()
-        .or_else(|| tagged.first_tag())
-        .and_then(|tag| tag.pictures().first());
-    let Some(picture) = picture else {
+    let picture = Probe::open(source)
+        .ok()
+        .and_then(|probe| probe.read().ok())
+        .and_then(|tagged| {
+            tagged
+                .primary_tag()
+                .or_else(|| tagged.first_tag())
+                .and_then(|tag| tag.pictures().first().cloned())
+        });
+    if let Some(picture) = picture {
+        return save_picture(cache, track_id, mtime, &picture).map(Some);
+    }
+    let Some(parent) = source.parent() else {
         return Ok(None);
     };
-    save_picture(cache, track_id, mtime, picture).map(Some)
+    for name in ["cover", "folder"] {
+        for ext in ["jpg", "jpeg", "png", "webp"] {
+            let candidate = parent.join(format!("{name}.{ext}"));
+            if candidate.is_file() {
+                return save_sidecar(cache, track_id, mtime, &candidate).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn save_sidecar(cache: &Path, track_id: i64, mtime: u64, source: &Path) -> Result<PathBuf> {
+    let ext = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            if ext.eq_ignore_ascii_case("jpeg") {
+                "jpg"
+            } else {
+                ext
+            }
+        })
+        .unwrap_or("bin");
+    let path = cache.join(format!("{track_id}-{mtime}.{ext}"));
+    if path.is_file() {
+        return Ok(path);
+    }
+    fs::create_dir_all(cache).with_context(|| format!("creating art cache {}", cache.display()))?;
+    let tmp = cache.join(format!("{track_id}-{mtime}.{ext}.tmp"));
+    fs::copy(source, &tmp).with_context(|| format!("copying cover {}", source.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming {}", path.display()))?;
+    Ok(path)
 }
 
 fn save_picture(cache: &Path, track_id: i64, mtime: u64, picture: &Picture) -> Result<PathBuf> {
@@ -106,6 +141,21 @@ mod tests {
     fn unknown_mime_falls_back_to_bin_extension() {
         assert_eq!(extension(None), "bin");
         assert_eq!(extension(Some(&MimeType::Png)), "png");
+    }
+
+    #[test]
+    fn falls_back_to_a_cover_file_next_to_the_audio() {
+        let base = std::env::temp_dir().join(format!("melos-art-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("song.opus");
+        std::fs::write(&source, b"not audio").unwrap();
+        std::fs::write(base.join("cover.jpg"), vec![1, 2, 3]).unwrap();
+        let cache = base.join("cache");
+        let path = extract_to(8, &source, 99, &cache).unwrap().unwrap();
+        assert_eq!(path.file_name().unwrap(), "8-99.jpg");
+        assert_eq!(std::fs::read(path).unwrap(), vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

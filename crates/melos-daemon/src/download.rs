@@ -320,6 +320,7 @@ fn ingest(path: &str, uploader_hint: Option<&str>) -> Result<NewTrack> {
         album,
         duration_ms,
         mtime,
+        source_id: None,
     })
 }
 

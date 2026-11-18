@@ -1,4 +1,4 @@
-.TH MELOSD 1 "2026-11-18" "melos 0.3.0" "User Commands"
+.TH MELOSD 1 "2026-11-19" "melos 0.4.0" "User Commands"
 .SH NAME
 melosd \- resident daemon for the melos music player
 .SH SYNOPSIS
@@ -6,8 +6,8 @@ melosd \- resident daemon for the melos music player
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B melosd
-owns playback, the library index, lyrics cache, listening statistics, media
-downloads, and the MPRIS interface for
+owns playback, the library index, local source scanning, lyrics cache,
+listening statistics, media downloads, and the MPRIS interface for
 .BR melos (1).
 It listens on a Unix socket and accepts newline-delimited JSON commands from
 clients.
@@ -32,7 +32,7 @@ instead of
 .IR $XDG_CONFIG_HOME/melos/config.toml .
 .TP
 .BI \-\-music\-dir " DIR"
-Override the configured download directory.
+Override the configured managed music directory.
 .TP
 .BR \-h ", " \-\-help
 Print help.
@@ -62,8 +62,9 @@ itself and writes its output to
 Configuration, including download and mpv options.
 .TP
 .I ~/.local/share/melos/library.db
-SQLite index. Audio files are the source of truth; the index can be deleted
-and rebuilt by downloading tracks again.
+SQLite index of tracks, sources, playlists, lyrics, and listening statistics.
+Audio files are the source of truth; the index can be rebuilt by rescanning
+your sources.
 .TP
 .I ~/.local/state/melos/state.json
 Persisted queue, position, volume, shuffle, and repeat state. Written
@@ -76,7 +77,11 @@ Output from a daemon spawned by the TUI.
 yt-dlp stderr for each download job, kept for troubleshooting.
 .TP
 .I ~/.cache/melos/art
-Embedded cover art extracted from tracks and cached for the interface.
+Embedded or nearby cover art extracted from tracks and cached for the
+interface.
+.TP
+.I ~/Music/melos
+Managed library for downloads and copied imports.
 .TP
 .IR $XDG_RUNTIME_DIR /melos/daemon.sock
 Client socket, mode 0600.

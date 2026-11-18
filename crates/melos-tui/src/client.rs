@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 /// Protocol versions that can still be asked to shut down during an upgrade.
-const LEGACY_PROTOCOLS: &[u32] = &[3, 2, 1];
+const LEGACY_PROTOCOLS: &[u32] = &[4, 3, 2, 1];
 
 #[derive(Debug)]
 pub struct ClientHandle {

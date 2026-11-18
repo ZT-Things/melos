@@ -61,6 +61,8 @@ impl KeyMap {
             "pane_downloads",
             "pane_lyrics",
             "pane_stats",
+            "sources",
+            "rescan",
             "confirm",
             "pause",
             "next",

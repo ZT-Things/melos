@@ -4,3 +4,7 @@ complete -c melos -l config -r -F -d 'Path to config.toml'
 complete -c melos -l trace-startup -d 'Print startup timings after the UI exits'
 complete -c melos -n '__fish_use_subcommand' -a status -d 'Show whether the daemon is running'
 complete -c melos -n '__fish_use_subcommand' -a stop -d 'Stop playback and shut down the daemon'
+complete -c melos -n '__fish_use_subcommand' -a import -d 'Add folders or audio files to the library'
+complete -c melos -n '__fish_use_subcommand' -a scan -d 'Rescan every active music source'
+complete -c melos -n '__fish_seen_subcommand_from import' -l copy -d 'Copy into ~/Music/melos/Imported'
+complete -c melos -n '__fish_seen_subcommand_from import' -F

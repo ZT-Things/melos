@@ -1,10 +1,12 @@
 //! Client-local UI state: view, cursors, filter, input prompts, overlays.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use melos_proto::{
-    Action, DownloadState, ServerMsg, TrackRow, ViewModel, format_duration, truncate,
+    Action, DownloadState, ServerMsg, TrackRow, ViewModel, format_duration, paths, truncate,
 };
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
@@ -50,6 +52,7 @@ pub enum InputKind {
     RenameTrack(i64),
     RenamePlaylist(i64),
     LyricsPaste(i64),
+    SourcePath,
 }
 
 pub struct Input {
@@ -74,6 +77,13 @@ pub enum Overlay {
         track_id: i64,
         title: String,
         choice: DeleteChoice,
+    },
+    Sources {
+        index: usize,
+    },
+    ImportChoice {
+        path: String,
+        copy: bool,
     },
 }
 
@@ -286,6 +296,9 @@ impl App {
                 self.status_override = Some("melosd stopped".into());
                 self.quit = true;
             }
+        }
+        if let Some(Overlay::Sources { index }) = &mut self.overlay {
+            *index = (*index).min(self.vm.sources.len().saturating_sub(1));
         }
         self.clamp_cursor();
     }
@@ -596,6 +609,9 @@ impl App {
                         self.filter.clear();
                     }
                 }
+                KeyCode::Tab if input.kind == InputKind::SourcePath => {
+                    input.buffer = complete_path(&input.buffer);
+                }
                 KeyCode::Enter if lyrics_paste => {
                     input.buffer.push('\n');
                 }
@@ -652,6 +668,14 @@ impl App {
                                 } else {
                                     actions.push(Action::YtSearch { query: text });
                                 }
+                            }
+                        }
+                        InputKind::SourcePath => {
+                            if !text.is_empty() {
+                                self.overlay = Some(Overlay::ImportChoice {
+                                    path: text,
+                                    copy: false,
+                                });
                             }
                         }
                     }
@@ -751,6 +775,65 @@ impl App {
                             title,
                             choice,
                         });
+                    }
+                },
+                Overlay::Sources { mut index } => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if index + 1 < self.vm.sources.len() {
+                            index += 1;
+                        }
+                        self.overlay = Some(Overlay::Sources { index });
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        index = index.saturating_sub(1);
+                        self.overlay = Some(Overlay::Sources { index });
+                    }
+                    KeyCode::Char('a') => {
+                        self.input = Some(Input {
+                            kind: InputKind::SourcePath,
+                            buffer: String::new(),
+                        });
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(source) = self.vm.sources.get(index) {
+                            actions.push(Action::ForgetSource {
+                                source_id: source.id,
+                            });
+                        }
+                        self.overlay = Some(Overlay::Sources { index });
+                    }
+                    KeyCode::Char('R') => {
+                        actions.push(Action::RescanAll);
+                        self.overlay = Some(Overlay::Sources { index });
+                    }
+                    KeyCode::Enter => {
+                        if let Some(source) = self.vm.sources.get(index) {
+                            actions.push(Action::RescanSource {
+                                source_id: source.id,
+                            });
+                        }
+                        self.overlay = Some(Overlay::Sources { index });
+                    }
+                    _ => {
+                        self.overlay = Some(Overlay::Sources { index });
+                    }
+                },
+                Overlay::ImportChoice { path, mut copy } => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        copy = false;
+                        self.overlay = Some(Overlay::ImportChoice { path, copy });
+                    }
+                    KeyCode::Char('c') | KeyCode::Down => {
+                        copy = true;
+                        self.overlay = Some(Overlay::ImportChoice { path, copy });
+                    }
+                    KeyCode::Enter => {
+                        actions.push(Action::AddSource { path, copy });
+                    }
+                    _ => {
+                        self.overlay = Some(Overlay::ImportChoice { path, copy });
                     }
                 },
             }
@@ -910,6 +993,17 @@ impl App {
                 self.focus = Focus::Main;
                 actions.push(Action::RequestStats);
             }
+            "sources" => {
+                self.overlay = Some(Overlay::Sources {
+                    index: self
+                        .vm
+                        .sources
+                        .iter()
+                        .position(|source| source.active)
+                        .unwrap_or(0),
+                });
+            }
+            "rescan" => actions.push(Action::RescanAll),
             "lyrics_paste" => {
                 if self.view == View::Lyrics {
                     self.open_lyrics_paste();
@@ -1205,6 +1299,89 @@ pub fn track_label(t: &TrackRow) -> String {
         t.artist,
         format_duration(t.duration_ms)
     )
+}
+
+/// Complete the last path component against the filesystem.
+///
+/// Tab completion deliberately only enumerates one directory level. The source
+/// prompt is for pasting a remembered path, not a full file browser.
+pub fn complete_path(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    if input == "~" {
+        return "~/".to_string();
+    }
+
+    let expanded = paths::expand_tilde(input);
+    let (dir, prefix) = if input.ends_with('/') {
+        (expanded, String::new())
+    } else {
+        let parent = expanded
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let prefix = expanded
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (parent, prefix)
+    };
+
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return input.to_string();
+    };
+    let mut names: Vec<(String, bool)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            Some((name, is_dir))
+        })
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    if names.is_empty() {
+        return input.to_string();
+    }
+
+    let base = if input.ends_with('/') {
+        input.to_string()
+    } else if let Some((parent, _)) = input.rsplit_once('/') {
+        format!("{parent}/")
+    } else {
+        String::new()
+    };
+
+    if names.len() == 1 {
+        let (name, is_dir) = &names[0];
+        return format!("{base}{name}{}", if *is_dir { "/" } else { "" });
+    }
+
+    let common = names
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .reduce(common_prefix)
+        .unwrap_or("");
+    if common.len() > prefix.len() {
+        format!("{base}{common}")
+    } else {
+        input.to_string()
+    }
+}
+
+fn common_prefix<'a>(left: &'a str, right: &'a str) -> &'a str {
+    let mut end = 0;
+    for (a, b) in left.chars().zip(right.chars()) {
+        if a != b {
+            break;
+        }
+        end += a.len_utf8();
+    }
+    &left[..end]
 }
 
 #[cfg(test)]
@@ -1743,5 +1920,105 @@ mod tests {
         assert_eq!(app.art_aspect(), Some(1.0));
         assert!(!app.art_pending(), "decode queue is drained");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_completion_fills_a_single_directory_with_a_slash() {
+        let dir = std::env::temp_dir().join(format!("melos-complete-one-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Albums")).unwrap();
+        let prefix = format!("{}/Al", dir.display());
+        assert_eq!(complete_path(&prefix), format!("{}/Albums/", dir.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_completion_extends_the_common_prefix_and_leaves_files_unslashed() {
+        let dir = std::env::temp_dir().join(format!("melos-complete-many-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("Alpha")).unwrap();
+        std::fs::create_dir_all(dir.join("Alpine")).unwrap();
+        std::fs::write(dir.join("song.opus"), b"test").unwrap();
+
+        let prefix = format!("{}/Al", dir.display());
+        assert_eq!(complete_path(&prefix), format!("{}/Alp", dir.display()));
+        let song = format!("{}/so", dir.display());
+        assert_eq!(complete_path(&song), format!("{}/song.opus", dir.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_completion_expands_a_bare_tilde() {
+        assert_eq!(complete_path("~"), "~/");
+    }
+
+    #[test]
+    fn music_sources_overlay_rescans_the_selected_source() {
+        let mut app = app_with_tracks();
+        app.vm.sources = vec![
+            melos_proto::SourceRow {
+                id: 1,
+                path: "/music/one".into(),
+                kind: melos_proto::SourceKind::Folder,
+                active: true,
+                tracks: 4,
+                last_scan: None,
+            },
+            melos_proto::SourceRow {
+                id: 2,
+                path: "/music/two".into(),
+                kind: melos_proto::SourceKind::File,
+                active: false,
+                tracks: 0,
+                last_scan: None,
+            },
+        ];
+        app.on_key(key(KeyCode::Char('I')));
+        assert!(matches!(app.overlay, Some(Overlay::Sources { index: 0 })));
+        app.on_key(key(KeyCode::Char('j')));
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert_eq!(actions, vec![Action::RescanSource { source_id: 2 }]);
+        let actions = app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(actions, vec![Action::ForgetSource { source_id: 2 }]);
+    }
+
+    #[test]
+    fn source_path_prompt_opens_the_keep_or_copy_choice_and_imports() {
+        let mut app = app_with_tracks();
+        app.on_key(key(KeyCode::Char('I')));
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(matches!(
+            app.input.as_ref().map(|input| &input.kind),
+            Some(InputKind::SourcePath)
+        ));
+        app.input.as_mut().unwrap().buffer = "~/Music/Albums".into();
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert!(actions.is_empty());
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ImportChoice { copy: false, .. })
+        ));
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            actions,
+            vec![Action::AddSource {
+                path: "~/Music/Albums".into(),
+                copy: false
+            }]
+        );
+        assert!(app.overlay.is_none());
+
+        app.on_key(key(KeyCode::Char('I')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.input.as_mut().unwrap().buffer = "~/Music/Albums".into();
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Char('c')));
+        let actions = app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            actions,
+            vec![Action::AddSource {
+                path: "~/Music/Albums".into(),
+                copy: true
+            }]
+        );
     }
 }

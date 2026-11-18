@@ -8,6 +8,7 @@ mod lyrics;
 mod mpris;
 mod mpv;
 mod player;
+mod scan;
 mod state;
 
 use std::path::PathBuf;
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
     let (listener, owned_socket) = bind_listener()?;
 
     let db = Db::open(&paths::db_path())?;
+    db.ensure_managed_source(&cfg.music_dir_path())?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Internal>();
 

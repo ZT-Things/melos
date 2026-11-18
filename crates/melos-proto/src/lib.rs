@@ -10,7 +10,7 @@ pub mod paths;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Bump on every breaking change to the wire format.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Transport / UI model
@@ -180,6 +180,35 @@ pub struct LyricsView {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    #[default]
+    Managed,
+    Folder,
+    File,
+}
+
+impl SourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceKind::Managed => "managed",
+            SourceKind::Folder => "folder",
+            SourceKind::File => "file",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRow {
+    pub id: i64,
+    pub path: String,
+    pub kind: SourceKind,
+    pub active: bool,
+    pub tracks: u64,
+    pub last_scan: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewModel {
     pub daemon_version: String,
@@ -201,6 +230,10 @@ pub struct ViewModel {
     pub lyrics_loading: bool,
     #[serde(default)]
     pub lyrics_error: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<SourceRow>,
+    #[serde(default)]
+    pub scanning: bool,
     pub status: String,
 }
 
@@ -222,6 +255,8 @@ impl Default for ViewModel {
             lyrics: None,
             lyrics_loading: false,
             lyrics_error: None,
+            sources: Vec::new(),
+            scanning: false,
             status: String::new(),
         }
     }
@@ -296,6 +331,18 @@ pub enum Action {
     },
 
     LibraryRefresh,
+    AddSource {
+        path: String,
+        #[serde(default)]
+        copy: bool,
+    },
+    ForgetSource {
+        source_id: i64,
+    },
+    RescanSource {
+        source_id: i64,
+    },
+    RescanAll,
     DeleteTrack {
         track_id: i64,
         #[serde(default)]
@@ -502,6 +549,13 @@ mod tests {
                 len: 2,
                 delta: 1,
             },
+            Action::AddSource {
+                path: "~/Music".into(),
+                copy: false,
+            },
+            Action::ForgetSource { source_id: 3 },
+            Action::RescanSource { source_id: 3 },
+            Action::RescanAll,
         ];
         for a in acts {
             let s = serde_json::to_string(&a).unwrap();
@@ -531,6 +585,8 @@ mod tests {
         assert!(vm.lyrics.is_none());
         assert!(!vm.lyrics_loading);
         assert!(vm.lyrics_error.is_none());
+        assert!(vm.sources.is_empty());
+        assert!(!vm.scanning);
     }
 
     #[test]

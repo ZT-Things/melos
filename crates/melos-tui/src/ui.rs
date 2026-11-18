@@ -46,6 +46,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Overlay::DeleteTrack { title, choice, .. } => {
                 draw_delete(frame, area, title, *choice);
             }
+            Overlay::Sources { index } => draw_sources(frame, app, area, *index),
+            Overlay::ImportChoice { path, copy } => {
+                draw_import_choice(frame, area, path, *copy);
+            }
         }
     }
     if let Some(input) = &app.input {
@@ -801,6 +805,10 @@ fn draw_input(frame: &mut Frame, app: &App, kind: &InputKind, buffer: &str, area
         InputKind::RenameTrack(_) => ("rename track", "Enter save · Esc cancel"),
         InputKind::RenamePlaylist(_) => ("rename playlist", "Enter save · Esc cancel"),
         InputKind::LyricsPaste(_) => ("lyrics", "Ctrl+S save · Esc cancel"),
+        InputKind::SourcePath => (
+            "music source path",
+            "Tab complete · Enter choose import · Esc cancel",
+        ),
     };
     let text = format!(" {label}: {buffer}▏  {hint}");
     frame.render_widget(
@@ -850,6 +858,124 @@ fn draw_lyrics_paste(frame: &mut Frame, app: &App, track_id: i64, buffer: &str, 
             .wrap(Wrap { trim: false }),
         text_area,
     );
+}
+
+fn draw_sources(frame: &mut Frame, app: &App, area: Rect, index: usize) {
+    let width = area.width.saturating_sub(8).clamp(52, 96);
+    let height = ((app.vm.sources.len() as u16).saturating_add(6))
+        .clamp(8, 18)
+        .min(area.height);
+    let popup = centered_abs(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Music sources ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height < 2 {
+        return;
+    }
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    if app.vm.sources.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No music sources yet. Press a to add a folder or file.")
+                .style(Style::default().fg(DIM)),
+            list_area,
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .vm
+            .sources
+            .iter()
+            .map(|source| {
+                let active = if source.active { "active" } else { "forgotten" };
+                let scanned = if source.last_scan.is_some() {
+                    "scanned"
+                } else {
+                    "not scanned"
+                };
+                let style = if source.active {
+                    Style::default()
+                } else {
+                    Style::default().fg(DIM)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<8} ", source.kind.label()),
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(fit(&source.path, width.saturating_sub(36) as usize), style),
+                    Span::styled(
+                        format!("  {} · {} tracks · {}", active, source.tracks, scanned),
+                        Style::default().fg(DIM),
+                    ),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(index));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD)),
+            list_area,
+            &mut state,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("j/k select · a add · d forget · Enter rescan · R rescan all · Esc close")
+            .style(Style::default().fg(DIM)),
+        hint_area,
+    );
+}
+
+fn draw_import_choice(frame: &mut Frame, area: Rect, path: &str, copy: bool) {
+    let popup = centered_abs(78, 11, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Add music source ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let option = |selected: bool, label: &str, detail: &str| {
+        let marker = if selected { "▸ " } else { "  " };
+        let style = if selected {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Line::from(vec![
+            Span::styled(format!("{marker}{label:<30}"), style),
+            Span::styled(detail.to_string(), Style::default().fg(DIM)),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            fit(path, inner.width as usize),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        option(
+            !copy,
+            "Keep files where they are",
+            "index in place, no copies",
+        ),
+        option(copy, "Copy into melos library", "~/Music/melos/Imported"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "k keep · c copy · j/k choose · Enter import · Esc cancel",
+            Style::default().fg(DIM),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_delete(frame: &mut Frame, area: Rect, title: &str, choice: DeleteChoice) {
@@ -1051,6 +1177,8 @@ fn friendly(action: &str) -> String {
         "pane_downloads" => "downloads pane",
         "pane_lyrics" => "lyrics pane",
         "pane_stats" => "statistics pane",
+        "sources" => "music sources",
+        "rescan" => "rescan sources",
         "confirm" => "play / open",
         "pause" => "play-pause",
         "next" => "next track",
@@ -1223,5 +1351,38 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(2, 19)].symbol(), "▶");
         assert_eq!(buffer[(2, 23)].symbol(), "r");
+    }
+
+    #[test]
+    fn music_sources_overlay_lists_paths_and_hints() {
+        let vm = ViewModel {
+            sources: vec![melos_proto::SourceRow {
+                id: 1,
+                path: "/music/Albums".into(),
+                kind: melos_proto::SourceKind::Folder,
+                active: true,
+                tracks: 12,
+                last_scan: Some(1),
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(
+            vm,
+            KeyMap::from_config(&melos_proto::config::Config::default().keys),
+        );
+        app.overlay = Some(Overlay::Sources { index: 0 });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Music sources"));
+        assert!(text.contains("/music/Albums"));
+        assert!(text.contains("folder"));
+        assert!(text.contains("Enter rescan"));
     }
 }

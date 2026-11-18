@@ -1,6 +1,6 @@
-.TH MELOS 1 "2026-11-18" "melos 0.3.0" "User Commands"
+.TH MELOS 1 "2026-11-19" "melos 0.4.0" "User Commands"
 .SH NAME
-melos \- fast, minimal terminal music player with YouTube downloads
+melos \- fast, minimal terminal music player for local files and YouTube downloads
 .SH SYNOPSIS
 .B melos
 [\fIOPTIONS\fR]
@@ -10,14 +10,23 @@ melos \- fast, minimal terminal music player with YouTube downloads
 .br
 .B melos
 .B stop
+.br
+.B melos
+.B import
+[\fB\-\-copy\fR] \fIPATH\fR...
+.br
+.B melos
+.B scan
 .SH DESCRIPTION
 .B melos
 is a terminal music player. It connects to the resident
 .BR melosd (1)
 daemon, starting it on demand, and displays a keyboard-driven interface for the
-library, playlists, queue, downloads, lyrics, and listening statistics. The
-selected track's cover art appears in the sidebar when the file has embedded
-art. Lyrics are fetched from LRCLIB and can be pasted or edited manually.
+library, playlists, queue, downloads, lyrics, and listening statistics. Local
+folders and audio files can be indexed where they are or copied into the
+managed library. The selected track's cover art appears in the sidebar when the
+file has embedded art or a nearby cover image. Lyrics are fetched from LRCLIB
+and can be pasted or edited manually.
 .PP
 The daemon owns playback and continues when the client exits. Press
 .B q
@@ -49,6 +58,15 @@ current track.
 .TP
 .B stop
 Ask the daemon to stop playback and exit.
+.TP
+.BI import " [\-\-copy] " PATH ...
+Add folders or individual audio files to the library. Without
+.B \-\-copy
+the originals are indexed in place; with it they are copied into
+.IR ~/Music/melos/Imported .
+.TP
+.B scan
+Rescan every active music source.
 .SH KEY BINDINGS
 Navigation accepts both vim keys and the usual arrow keys.
 .TP
@@ -68,6 +86,20 @@ Switch between the sidebar and the main pane.
 Open Library, Playlists, Queue, Downloads, Lyrics, or Statistics. Opening
 Library, a playlist, or the queue moves the cursor to the currently playing
 track.
+.TP
+.B I
+Open the music sources overlay. Use
+.B a
+to add a folder or file,
+.B d
+to forget the selected source,
+.B Enter
+to rescan it, and
+.B R
+to rescan every active source. Forgetting never deletes files.
+.TP
+.B R
+Rescan every active music source.
 .TP
 .B Enter
 Play the selected track, open a playlist, confirm an input, or seek to the
@@ -124,7 +156,8 @@ download, or open the removal dialog on a Library track.
 .TP
 .B Delete
 Remove the selected track from the library. A dialog chooses between forgetting
-the track in melos only and deleting the downloaded audio file as well.
+the track in melos only and deleting the audio file as well. File deletion is
+allowed only inside the managed library or an active source.
 .TP
 .BR e ", " F2
 Rename the selected playlist or track. This changes melos' display name only;
@@ -189,7 +222,7 @@ the help overlay reflects the active keymap.
 Configuration.
 .TP
 .I ~/.local/share/melos/library.db
-SQLite index of downloaded tracks and playlists.
+SQLite index of tracks, sources, playlists, lyrics, and statistics.
 .TP
 .I ~/.local/state/melos/state.json
 Queue, position, volume, shuffle, and repeat state.
@@ -201,7 +234,7 @@ Extracted cover art cache.
 Unix socket used by the client.
 .TP
 .I ~/Music/melos
-Default download directory.
+Managed library for downloads and copied imports.
 .SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME
@@ -243,6 +276,15 @@ Check what is playing without opening the interface:
 .nf
 .RS
 melos status
+.RE
+.fi
+.PP
+Index a folder in place, then copy another folder into the managed library:
+.PP
+.nf
+.RS
+melos import ~/Music/Albums
+melos import --copy ~/Downloads/New\\ Album
 .RE
 .fi
 .PP

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use melos_proto::{
-    Action, DownloadRow, DownloadState, LyricsView, PlaylistRow, Repeat, ServerMsg, TrackRow,
-    Transport, ViewModel, YtResultRow, config::Config, lyrics::has_timestamps,
+    Action, DownloadRow, DownloadState, LyricsView, PlaylistRow, Repeat, ServerMsg, SourceKind,
+    SourceRow, TrackRow, Transport, ViewModel, YtResultRow, config::Config, lyrics::has_timestamps,
     lyrics::plain_from_lrc, paths,
 };
 use mpris_server::Server;
@@ -22,6 +22,7 @@ use crate::lyrics;
 use crate::mpris::{self, Info, Mpris, TrackInfo};
 use crate::mpv::MpvEvent;
 use crate::player::Player;
+use crate::scan;
 
 pub enum Internal {
     Action(Action),
@@ -37,6 +38,8 @@ pub enum Internal {
         track_id: i64,
         result: Result<lyrics::FetchedLyrics, String>,
     },
+    Scanned(Vec<scan::ScanResult>),
+    Imported(Result<PathBuf, String>),
     Note(String),
     Tick,
 }
@@ -75,6 +78,12 @@ pub struct Daemon {
     lyrics_track: Option<i64>,
     lyrics_loading: bool,
     lyrics_error: Option<String>,
+    sources: Vec<SourceRow>,
+    scanning: bool,
+    importing: bool,
+    scan_started: bool,
+    pending_scan: Vec<i64>,
+    managed_source_id: Option<i64>,
 }
 
 impl Daemon {
@@ -114,6 +123,11 @@ impl Daemon {
         } else {
             "mpv is not available — playback disabled".to_string()
         };
+        let sources = db.sources().unwrap_or_default();
+        let managed_source_id = sources
+            .iter()
+            .find(|source| source.kind == SourceKind::Managed)
+            .map(|source| source.id);
 
         Self {
             cfg,
@@ -144,6 +158,12 @@ impl Daemon {
             lyrics_track: None,
             lyrics_loading: false,
             lyrics_error: None,
+            sources,
+            scanning: false,
+            importing: false,
+            scan_started: false,
+            pending_scan: Vec::new(),
+            managed_source_id,
         }
     }
 
@@ -218,6 +238,17 @@ impl Daemon {
                 };
                 if tx.send(welcome).is_ok() {
                     self.clients.push(tx);
+                    if !self.scan_started {
+                        self.scan_started = true;
+                        let ids: Vec<i64> = self
+                            .sources
+                            .iter()
+                            .filter(|source| source.active)
+                            .map(|source| source.id)
+                            .collect();
+                        self.start_scan(ids);
+                        self.broadcast_state();
+                    }
                 }
             }
             Internal::Mpris(server, info) => {
@@ -257,6 +288,30 @@ impl Daemon {
                     self.push_lyrics();
                     self.broadcast_state();
                 }
+            }
+            Internal::Scanned(results) => {
+                self.scanning = false;
+                if let Err(error) = self.apply_scan(results) {
+                    self.status = format!("scan failed: {error}");
+                }
+                if !self.pending_scan.is_empty() {
+                    let pending = std::mem::take(&mut self.pending_scan);
+                    self.start_scan(pending);
+                }
+                self.broadcast_state();
+            }
+            Internal::Imported(result) => {
+                self.importing = false;
+                match result {
+                    Ok(target) => {
+                        self.status = format!("imported {}", target.display());
+                        if let Some(id) = self.managed_source_id {
+                            self.start_scan(vec![id]);
+                        }
+                    }
+                    Err(error) => self.status = format!("import failed: {error}"),
+                }
+                self.broadcast_state();
             }
             Internal::Note(note) => {
                 self.status = note;
@@ -452,12 +507,12 @@ impl Daemon {
                     anyhow::bail!("track is no longer in the library");
                 };
                 if delete_file {
-                    let music = std::fs::canonicalize(self.cfg.music_dir_path())
-                        .context("music directory is not available")?;
                     let target = std::fs::canonicalize(&path)
                         .with_context(|| format!("audio file not found: {path}"))?;
-                    if !file_within(&music, &target) {
-                        anyhow::bail!("refusing to delete a file outside the music directory");
+                    if !self.can_delete_file(&target)? {
+                        anyhow::bail!(
+                            "refusing to delete a file that is not in an active music source"
+                        );
                     }
                     std::fs::remove_file(&target)
                         .with_context(|| format!("could not delete {}", target.display()))?;
@@ -696,9 +751,230 @@ impl Daemon {
                 }
                 self.status = format!("lyrics offset {:+} ms", offset);
             }
+            Action::AddSource { path, copy } => {
+                self.add_source_action(&path, copy)?;
+            }
+            Action::ForgetSource { source_id } => {
+                self.forget_source_action(source_id)?;
+            }
+            Action::RescanSource { source_id } => {
+                let Some(source) = self.sources.iter().find(|source| source.id == source_id) else {
+                    anyhow::bail!("source not found");
+                };
+                if !source.active {
+                    anyhow::bail!("source is forgotten — add it again to rescan");
+                }
+                self.start_scan(vec![source_id]);
+            }
+            Action::RescanAll => {
+                let ids: Vec<i64> = self
+                    .sources
+                    .iter()
+                    .filter(|source| source.active)
+                    .map(|source| source.id)
+                    .collect();
+                self.start_scan(ids);
+            }
             Action::Shutdown => {}
         }
         Ok(())
+    }
+
+    fn start_scan(&mut self, source_ids: Vec<i64>) {
+        if self.scanning {
+            for id in source_ids {
+                if !self.pending_scan.contains(&id) {
+                    self.pending_scan.push(id);
+                }
+            }
+            self.status = "a library scan is already running; next scan queued".into();
+            return;
+        }
+        let sources: Vec<SourceRow> = self
+            .sources
+            .iter()
+            .filter(|source| source.active && source_ids.contains(&source.id))
+            .cloned()
+            .collect();
+        if sources.is_empty() {
+            self.status = "no active music sources to scan".into();
+            return;
+        }
+        let known: Vec<(i64, HashMap<String, i64>)> = sources
+            .iter()
+            .map(|source| {
+                (
+                    source.id,
+                    self.db.path_mtimes(source.id).unwrap_or_default(),
+                )
+            })
+            .collect();
+        self.scanning = true;
+        self.status = format!("scanning {} music source(s)…", sources.len());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let results = tokio::task::spawn_blocking(move || {
+                sources
+                    .into_iter()
+                    .map(|source| {
+                        let known = known
+                            .iter()
+                            .find(|(id, _)| *id == source.id)
+                            .map(|(_, map)| map.clone())
+                            .unwrap_or_default();
+                        scan::scan_source(&source, &known)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let _ = tx.send(Internal::Scanned(results));
+        });
+    }
+
+    fn apply_scan(&mut self, results: Vec<scan::ScanResult>) -> Result<()> {
+        let mut updated = 0;
+        let mut warnings = 0;
+        for result in results {
+            for track in &result.tracks {
+                self.db.upsert_scanned(track)?;
+                updated += 1;
+            }
+            self.db
+                .mark_missing_for_source(result.source_id, &result.seen)?;
+            self.db
+                .set_source_last_scan(result.source_id, crate::db::now_unix())?;
+            warnings += result.errors.len();
+        }
+        self.refresh_sources()?;
+        self.refresh_library()?;
+        self.refresh_playlists()?;
+        self.refresh_playlist_tracks()?;
+        self.status = if warnings > 0 {
+            format!("scan finished: {updated} updated, {warnings} warnings")
+        } else {
+            format!("scan finished: {updated} updated")
+        };
+        Ok(())
+    }
+
+    fn refresh_sources(&mut self) -> Result<()> {
+        self.sources = self.db.sources()?;
+        self.managed_source_id = self
+            .sources
+            .iter()
+            .find(|source| source.kind == SourceKind::Managed)
+            .map(|source| source.id);
+        Ok(())
+    }
+
+    fn add_source_action(&mut self, path: &str, copy: bool) -> Result<()> {
+        let expanded = paths::expand_tilde(path);
+        let source_path = expanded
+            .canonicalize()
+            .with_context(|| format!("path not found: {}", expanded.display()))?;
+        let is_dir = source_path.is_dir();
+        let kind = if is_dir {
+            SourceKind::Folder
+        } else {
+            SourceKind::File
+        };
+        if kind == SourceKind::File && !scan::is_audio(&source_path) {
+            anyhow::bail!("{} is not an audio file", source_path.display());
+        }
+        let managed = std::fs::canonicalize(self.cfg.music_dir_path())
+            .context("music directory is not available")?;
+
+        if copy {
+            let target = scan::import_target(&source_path, &managed)?;
+            if target.exists() {
+                anyhow::bail!("already exists: {}", target.display());
+            }
+            self.importing = true;
+            self.status = format!("copying {} into the library…", source_path.display());
+            let tx = self.tx.clone();
+            let source_path = source_path.clone();
+            let managed = managed.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    scan::copy_into_managed(&source_path, &managed)
+                })
+                .await
+                .map_err(|error| format!("copy failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+                let _ = tx.send(Internal::Imported(result));
+            });
+            return Ok(());
+        }
+
+        if source_path.starts_with(&managed) {
+            anyhow::bail!("that path is already inside the melos library");
+        }
+        let source_string = source_path.to_string_lossy().to_string();
+        let existing = self.db.sources()?;
+        for source in &existing {
+            let Ok(root) = std::fs::canonicalize(&source.path) else {
+                continue;
+            };
+            if root == source_path {
+                let id = self.db.add_source(&source_string, kind)?;
+                self.refresh_sources()?;
+                self.start_scan(vec![id]);
+                self.status = format!("added source {}", source_path.display());
+                return Ok(());
+            }
+            if source_path.starts_with(&root) || root.starts_with(&source_path) {
+                anyhow::bail!(
+                    "source overlaps {} — add the parent folder instead",
+                    source.path
+                );
+            }
+        }
+
+        let id = self.db.add_source(&source_string, kind)?;
+        self.refresh_sources()?;
+        self.start_scan(vec![id]);
+        self.status = format!("added source {}", source_path.display());
+        Ok(())
+    }
+
+    fn forget_source_action(&mut self, source_id: i64) -> Result<()> {
+        let Some(source) = self.sources.iter().find(|source| source.id == source_id) else {
+            anyhow::bail!("source not found");
+        };
+        if source.kind == SourceKind::Managed {
+            anyhow::bail!("the melos library is managed and cannot be forgotten");
+        }
+        let path = source.path.clone();
+        self.db.set_source_active(source_id, false)?;
+        self.refresh_sources()?;
+        self.refresh_library()?;
+        self.refresh_playlists()?;
+        self.refresh_playlist_tracks()?;
+        self.status = format!("forgot {path} — files were kept");
+        Ok(())
+    }
+
+    fn can_delete_file(&self, target: &Path) -> Result<bool> {
+        let managed = std::fs::canonicalize(self.cfg.music_dir_path())
+            .context("music directory is not available")?;
+        if target.starts_with(&managed) {
+            return Ok(true);
+        }
+        for source in self.db.active_sources()? {
+            if source.kind == SourceKind::File {
+                if let Ok(path) = std::fs::canonicalize(&source.path)
+                    && path == target
+                {
+                    return Ok(true);
+                }
+            } else if let Ok(root) = std::fs::canonicalize(&source.path)
+                && target.starts_with(root)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn load_cached_lyrics(&mut self, track_id: Option<i64>) {
@@ -812,6 +1088,8 @@ impl Daemon {
             }
             download::Event::Complete { id, track } => {
                 let title = track.title.clone();
+                let mut track = track;
+                track.source_id = self.managed_source_id;
                 match self.db.insert(&track) {
                     Ok(_) => {
                         if let Err(e) = self.refresh_library() {
@@ -973,6 +1251,8 @@ impl Daemon {
             lyrics: self.lyrics.clone(),
             lyrics_loading: self.lyrics_loading,
             lyrics_error: self.lyrics_error.clone(),
+            sources: self.sources.clone(),
+            scanning: self.scanning || self.importing,
             status: self.status.clone(),
         }
     }
@@ -1093,6 +1373,7 @@ impl Default for Persisted {
     }
 }
 
+#[cfg(test)]
 fn file_within(base: &Path, target: &Path) -> bool {
     target.starts_with(base)
 }
@@ -1307,6 +1588,12 @@ mod tests {
             lyrics_track: None,
             lyrics_loading: false,
             lyrics_error: None,
+            sources: Vec::new(),
+            scanning: false,
+            importing: false,
+            scan_started: false,
+            pending_scan: Vec::new(),
+            managed_source_id: None,
         };
         (daemon, base)
     }
@@ -1324,6 +1611,7 @@ mod tests {
                 album: None,
                 duration_ms: 60_000,
                 mtime: 1,
+                source_id: None,
             })
             .unwrap();
         (id, path)
@@ -1498,6 +1786,7 @@ mod tests {
                 album: None,
                 duration_ms: 1,
                 mtime: 1,
+                source_id: None,
             })
             .unwrap();
         assert!(
@@ -1522,6 +1811,7 @@ mod tests {
                 album: None,
                 duration_ms: 1,
                 mtime: 1,
+                source_id: None,
             })
             .unwrap();
         assert!(
@@ -1534,6 +1824,184 @@ mod tests {
         );
         assert!(daemon.db.track(id).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    async fn drain_until_library(daemon: &mut Daemon, rx: &mut mpsc::UnboundedReceiver<Internal>) {
+        for _ in 0..100 {
+            while let Ok(internal) = rx.try_recv() {
+                daemon.handle(internal).await;
+            }
+            if !daemon.tracks.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("scan did not finish");
+    }
+
+    #[tokio::test]
+    async fn adding_a_folder_scans_it_and_forgetting_keeps_files() {
+        let (mut daemon, base) = test_daemon("source-scan");
+        let folder = base.join("external");
+        std::fs::create_dir_all(&folder).unwrap();
+        let audio = folder.join("Artist - Song.opus");
+        std::fs::write(&audio, b"not audio").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        daemon.tx = tx;
+
+        daemon
+            .apply(Action::AddSource {
+                path: folder.display().to_string(),
+                copy: false,
+            })
+            .unwrap();
+        drain_until_library(&mut daemon, &mut rx).await;
+        assert_eq!(daemon.tracks.len(), 1);
+        assert_eq!(daemon.tracks[0].title, "Song");
+        let source = daemon
+            .sources
+            .iter()
+            .find(|source| source.kind == melos_proto::SourceKind::Folder)
+            .unwrap()
+            .clone();
+        let track_id = daemon.tracks[0].id;
+
+        daemon
+            .apply(Action::ForgetSource {
+                source_id: source.id,
+            })
+            .unwrap();
+        assert!(daemon.tracks.is_empty());
+        assert!(audio.exists());
+        assert!(
+            daemon
+                .apply(Action::DeleteTrack {
+                    track_id,
+                    delete_file: true,
+                })
+                .is_err()
+        );
+        assert!(audio.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn copying_a_folder_imports_it_into_the_managed_library() {
+        let (mut daemon, base) = test_daemon("source-copy");
+        let managed = daemon
+            .db
+            .ensure_managed_source(&daemon.cfg.music_dir_path())
+            .unwrap();
+        daemon.refresh_sources().unwrap();
+        assert_eq!(daemon.managed_source_id, Some(managed));
+        let folder = base.join("external");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Artist - Song.opus"), b"not audio").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        daemon.tx = tx;
+
+        daemon
+            .apply(Action::AddSource {
+                path: folder.display().to_string(),
+                copy: true,
+            })
+            .unwrap();
+        drain_until_library(&mut daemon, &mut rx).await;
+        assert_eq!(daemon.tracks.len(), 1);
+        assert!(
+            daemon
+                .cfg
+                .music_dir_path()
+                .join("Imported/external/Artist - Song.opus")
+                .is_file()
+        );
+        assert!(folder.join("Artist - Song.opus").is_file());
+        let error = daemon
+            .apply(Action::AddSource {
+                path: folder.display().to_string(),
+                copy: true,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn scan_requests_during_a_running_scan_are_queued() {
+        let (mut daemon, base) = test_daemon("source-queue");
+        let folder = base.join("external");
+        std::fs::create_dir_all(&folder).unwrap();
+        let id = daemon
+            .db
+            .add_source(
+                &folder.display().to_string(),
+                melos_proto::SourceKind::Folder,
+            )
+            .unwrap();
+        daemon.refresh_sources().unwrap();
+        daemon.scanning = true;
+        daemon.start_scan(vec![id]);
+        assert_eq!(daemon.pending_scan, vec![id]);
+        assert!(daemon.snapshot().scanning);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn snapshots_report_copy_imports_as_scanning() {
+        let (mut daemon, base) = test_daemon("source-importing");
+        daemon.importing = true;
+        assert!(daemon.snapshot().scanning);
+        daemon.importing = false;
+        assert!(!daemon.snapshot().scanning);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn overlapping_sources_and_non_audio_files_are_rejected() {
+        let (mut daemon, base) = test_daemon("source-overlap");
+        let parent = base.join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("song.opus"), b"x").unwrap();
+        daemon
+            .apply(Action::AddSource {
+                path: parent.display().to_string(),
+                copy: false,
+            })
+            .unwrap();
+        let error = daemon
+            .apply(Action::AddSource {
+                path: child.display().to_string(),
+                copy: false,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("overlaps"));
+
+        let text = base.join("notes.txt");
+        std::fs::write(&text, b"x").unwrap();
+        let error = daemon
+            .apply(Action::AddSource {
+                path: text.display().to_string(),
+                copy: false,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("not an audio file"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn managed_source_cannot_be_forgotten() {
+        let (mut daemon, base) = test_daemon("source-managed");
+        let id = daemon
+            .db
+            .ensure_managed_source(&daemon.cfg.music_dir_path())
+            .unwrap();
+        daemon.refresh_sources().unwrap();
+        let error = daemon
+            .apply(Action::ForgetSource { source_id: id })
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be forgotten"));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
